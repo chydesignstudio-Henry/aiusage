@@ -3,7 +3,7 @@ import { readFileSync, existsSync, statSync, writeFileSync, unlinkSync } from 'n
 import { join, extname, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createApiServer } from '../api/server.js'
-import { dashboardHost } from '../api/trust.js'
+import { dashboardHost, isLoopbackHost } from '../api/trust.js'
 import { getDashboardPassword } from '../auth.js'
 import { importConfigPriceOverrides, loadPricingRuntime } from '../pricing-registry.js'
 import { runParse } from './parse.js'
@@ -102,8 +102,11 @@ export function serve(options: ServeOptions): void {
   })
   runtimeSettings.start()
 
+  const exposed = !isLoopbackHost(host)
   const apiServer = createApiServer(options.db, {
     currentDeviceInstanceId: getState(AIUSAGE_DIR)?.deviceInstanceId,
+    protectPublicSummary: exposed,
+    redactSensitivePaths: exposed,
     onRefresh: () => runParse(options.db),
     onSyncStart: () => syncRuntime.start(),
     getSyncStatus: () => syncRuntime.getStatus(),
@@ -184,6 +187,9 @@ export function serve(options: ServeOptions): void {
     started = true
     writeFileSync(PORT_FILE, String(currentPort), 'utf-8')
     console.log(`aiusage serve listening on http://${host.includes(':') ? `[${host}]` : host}:${currentPort}`)
+    if (!isLoopbackHost(host)) {
+      console.log('[serve] non-loopback bind: password required, public summary locked, local paths redacted')
+    }
 
     // Start the initial parse only after the HTTP server is accepting connections.
     // Scheduling it on the next turn also lets the listening event finish first.

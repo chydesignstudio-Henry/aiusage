@@ -13,14 +13,38 @@ export function isLoopbackHost(host: string): boolean {
   return false
 }
 
+
+const WEAK_DASHBOARD_PASSWORDS = new Set([
+  'change-me',
+  'changeme',
+  'password',
+  'password123',
+  'admin',
+  'admin123',
+  '123456',
+  '12345678',
+  'aiusage',
+  'secret',
+  'default',
+  'letmein',
+])
+
+export function assertAcceptableDashboardPassword(password: string | null, host: string): void {
+  if (isLoopbackHost(host)) return
+  if (!password) {
+    throw new Error('Non-loopback --host requires AIUSAGE_DASHBOARD_PASSWORD to be set')
+  }
+  if (password.length < 12 || WEAK_DASHBOARD_PASSWORDS.has(password.toLowerCase())) {
+    throw new Error('Non-loopback --host requires AIUSAGE_DASHBOARD_PASSWORD of at least 12 characters and not a known placeholder such as change-me')
+  }
+}
+
 export function dashboardHost(host: string | undefined, password: string | null): string {
   const value = host ?? DEFAULT_DASHBOARD_HOST
   if (!value || value !== value.trim()) throw new Error('Invalid dashboard host')
   const normalized = value.replace(/^\[|\]$/g, '')
   if (normalized !== value && (isIP(normalized) !== 6 || value !== `[${normalized}]`)) throw new Error('Invalid dashboard host')
-  if (!isLoopbackHost(value) && !password) {
-    throw new Error('Non-loopback --host requires AIUSAGE_DASHBOARD_PASSWORD to be set')
-  }
+  assertAcceptableDashboardPassword(password, value)
   // Resolve localhost deterministically rather than trusting DNS/hosts-file overrides.
   return normalized.toLowerCase() === 'localhost' ? DEFAULT_DASHBOARD_HOST : normalized
 }

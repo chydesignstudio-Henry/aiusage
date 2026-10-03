@@ -1,7 +1,7 @@
 <script>
   import { page } from '$app/stores'
   import { onDestroy, onMount } from 'svelte'
-  import { lang, toggleLang, t } from '$lib/i18n.js'
+  import { lang, toggleLang, langLabel, t } from '$lib/i18n.js'
   import { userPref, cycleTheme, initTheme } from '$lib/theme.js'
   import { fetchConfig, fetchAuthStatus, login } from '$lib/api.js'
   import { displayCurrency, exchangeRate } from '$lib/stores.js'
@@ -204,8 +204,8 @@
         </svg>
         <span>AIUsage</span>
       </button>
-      <button class="public-lang" type="button" on:click={toggleLang} title={$lang === 'en' ? '中文' : 'EN'}>
-        {$lang === 'en' ? '中' : 'EN'}
+      <button class="public-lang" type="button" on:click={toggleLang} title={langLabel($lang)}>
+        {langLabel($lang)}
       </button>
     </header>
 
@@ -300,10 +300,10 @@
           {/if}
         </button>
 
-        <button class="ctrl-btn" on:click={toggleLang} title={$lang === 'en' ? '中文' : 'EN'}>
-          <span class="ctrl-icon lang-icon">{$lang === 'en' ? '中' : 'EN'}</span>
+        <button class="ctrl-btn" on:click={toggleLang} title={langLabel($lang)}>
+          <span class="ctrl-icon lang-icon">{langLabel($lang)}</span>
           {#if !collapsed}
-            <span class="ctrl-label">{$lang === 'en' ? '中文' : 'English'}</span>
+            <span class="ctrl-label">{langLabel($lang)}</span>
           {/if}
         </button>
 
@@ -317,7 +317,7 @@
         <a class="ctrl-btn" href="https://aiusage.jtanx.com" target="_blank" rel="noopener" title="aiusage.jtanx.com">
           <span class="ctrl-icon"><ExternalLink size={14} strokeWidth={1.75} /></span>
           {#if !collapsed}
-            <span class="ctrl-label">{$lang === 'en' ? 'Website' : '官网'}</span>
+            <span class="ctrl-label">{$lang === 'en' ? 'Website' : ($lang === 'zh-TW' ? '官網' : '官网')}</span>
           {/if}
         </a>
       </div>
@@ -345,7 +345,7 @@
           <span class="ctrl-icon"><svelte:component this={themeIcons[$userPref]} size={14} strokeWidth={1.75} /></span>
         </button>
         <button class="ctrl-btn" on:click={toggleLang}>
-          <span class="ctrl-icon lang-icon">{$lang === 'en' ? '中' : 'EN'}</span>
+          <span class="ctrl-icon lang-icon">{langLabel($lang)}</span>
         </button>
       </div>
     </header>

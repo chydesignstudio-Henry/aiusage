@@ -26,4 +26,7 @@ RUN pnpm --filter @aiusage/core build && pnpm --filter @aiusage/web build && pnp
 VOLUME /root/.aiusage
 EXPOSE 3847
 
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["node", "packages/cli/dist/index.js", "serve", "--host", "0.0.0.0", "--port", "3847"]

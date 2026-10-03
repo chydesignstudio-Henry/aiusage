@@ -18,9 +18,9 @@ describe('serve binding', () => {
     ['localhost', '', '127.0.0.1'],
     ['::1', '', '::1'],
     ['[::1]', '', '::1'],
-    ['0.0.0.0', 'secret', '0.0.0.0'],
-    ['::', 'secret', '::'],
-    ['192.168.1.20', 'secret', '192.168.1.20'],
+    ['0.0.0.0', 'correct-horse-battery', '0.0.0.0'],
+    ['::', 'correct-horse-battery', '::'],
+    ['192.168.1.20', 'correct-horse-battery', '192.168.1.20'],
   ])('binds host %s explicitly with the configured authentication', (host, password, expected) => {
     vi.stubEnv('AIUSAGE_DASHBOARD_PASSWORD', password)
     const listen = vi.spyOn(http.Server.prototype, 'listen').mockReturnThis()
@@ -41,6 +41,8 @@ describe('serve binding', () => {
     expect(isLoopbackHost('0:0:0:0:0:0:0:1')).toBe(true)
     expect(isLoopbackHost('::2')).toBe(false)
     expect(isLoopbackHost('127.evil.example')).toBe(false)
-    expect(() => dashboardHost('', 'secret')).toThrow('Invalid dashboard host')
+    expect(() => dashboardHost('', 'correct-horse-battery')).toThrow('Invalid dashboard host')
+    expect(() => dashboardHost('0.0.0.0', 'change-me')).toThrow('at least 12 characters')
+    expect(() => dashboardHost('0.0.0.0', 'short-pass')).toThrow('at least 12 characters')
   })
 })

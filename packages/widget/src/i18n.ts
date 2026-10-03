@@ -1,4 +1,4 @@
-export type Locale = 'en' | 'zh'
+export type Locale = 'en' | 'zh' | 'zh-TW'
 
 export interface Translations {
   today: string
@@ -132,7 +132,52 @@ const zh: Translations = {
   setupFailed: '配置失败',
 }
 
-const translations: Record<Locale, Translations> = { en, zh }
+const zhTW: Translations = {
+  today: '今日',
+  lastNDays: (n) => `近 ${n} 天`,
+  tokenBreakdown: 'Token 分佈',
+  tokenBreakdownToday: 'Token 分佈 (今日)',
+  trend: '趨勢',
+  topModel: '常用模型',
+  topTool: '常用工具',
+  sessions: '會話數',
+  settings: '設定',
+  theme: '主題',
+  timeRange: '時間範圍',
+  refreshInterval: '重新整理間隔',
+  display: '顯示',
+  currency: '幣種',
+  exchangeRate: '匯率',
+  exchangeRateUpdated: (time) => `更新於 ${time}`,
+  exchangeRateUnavailable: '匯率不可用',
+  language: '語言',
+  showCost: '顯示費用',
+  tokenBreakdownToggle: 'Token 分佈',
+  activityChart: '活動圖表',
+  syncedAt: (time) => `同步於 ${time}`,
+  themeSystem: '跟隨系統',
+  themeLight: '淺色',
+  themeDark: '深色',
+  showPanel: '顯示面板',
+  openDashboard: '開啟儀表板',
+  refresh: '重新整理',
+  quit: '退出',
+  close: '關閉',
+  installTitle: '儀表板配置',
+  installPreparing: '準備中...',
+  installInstalling: '正在安裝 @juliantanx/aiusage...',
+  installLaunching: '正在啟動儀表板...',
+  installDone: '完成！正在開啟...',
+  installFailed: '安裝失敗',
+  setupTitle: '首次配置',
+  setupChecking: '檢測 CLI...',
+  setupParsing: '解析使用日誌...',
+  setupDone: '就緒！',
+  setupFailed: '配置失敗',
+}
+
+const translations: Record<Locale, Translations> = { en, zh, 'zh-TW': zhTW }
+
 
 export function t(locale: Locale): Translations {
   return translations[locale] ?? translations.en

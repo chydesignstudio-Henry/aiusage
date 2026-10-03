@@ -72,7 +72,8 @@
 
   const locales: Array<{ label: string; value: Locale }> = [
     { label: 'English', value: 'en' },
-    { label: '中文', value: 'zh' },
+    { label: '繁體中文', value: 'zh-TW' },
+    { label: '简体中文', value: 'zh' },
   ]
 </script>
 

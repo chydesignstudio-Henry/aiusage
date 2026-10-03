@@ -39,7 +39,10 @@
   }
 
   function detectInitialLocale(): Locale {
-    return typeof navigator !== 'undefined' && navigator.language.toLowerCase().startsWith('zh') ? 'zh' : 'en'
+    const nav = typeof navigator !== 'undefined' ? navigator.language.toLowerCase() : ''
+    if (nav.startsWith('zh-tw') || nav.startsWith('zh-hk') || nav.startsWith('zh-hant')) return 'zh-TW'
+    if (nav.startsWith('zh')) return 'zh'
+    return 'en'
   }
 
   let data: WidgetData | null = null

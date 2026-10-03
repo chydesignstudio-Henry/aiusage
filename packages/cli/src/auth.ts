@@ -37,13 +37,13 @@ export function isPublicPath(pathname: string): boolean {
   return isStaticAssetPath(pathname)
 }
 
-export function shouldProtectApiPath(pathname: string): boolean {
+export function shouldProtectApiPath(pathname: string, options?: { protectPublicSummary?: boolean }): boolean {
   if (!pathname.startsWith('/api/')) return false
   if (['/api/auth/status', '/api/auth/login', '/api/auth/logout'].includes(pathname)) return false
 
-  // The minimal home-page totals endpoint is deliberately public; every other
-  // data API, including the detailed /api/summary breakdown, requires auth.
-  if (pathname === '/api/home-summary') return false
+  // Loopback may expose aggregate totals without a password. A non-loopback
+  // bind must not: anyone on the LAN could read usage without credentials.
+  if (pathname === '/api/home-summary') return options?.protectPublicSummary === true
   return true
 }
 

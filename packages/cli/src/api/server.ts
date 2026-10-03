@@ -251,9 +251,14 @@ function getDateRangeFilter(range: string | null, from: string | null, to: strin
   return { where: `AND ${ts} >= @start`, params: { start: today.getTime() } }
 }
 
+const REDACT_PATHS = Symbol('aiusage.redactPaths')
+
 function json(res: http.ServerResponse, data: unknown, status = 200): void {
+  const payload = (res as http.ServerResponse & { [REDACT_PATHS]?: boolean })[REDACT_PATHS]
+    ? redactSensitivePaths(data)
+    : data
   res.writeHead(status, { 'Content-Type': 'application/json' })
-  res.end(JSON.stringify(data))
+  res.end(JSON.stringify(payload))
 }
 
 function isDatabaseLockedError(error: unknown): boolean {
@@ -391,6 +396,10 @@ async function proxyCloudSyncStatus(res: http.ServerResponse): Promise<void> {
 
 export interface ApiServerOptions {
   currentDeviceInstanceId?: string
+  /** Require auth for /api/home-summary. Set when the dashboard is not loopback-only. */
+  protectPublicSummary?: boolean
+  /** Strip home directory and username from paths in JSON responses. */
+  redactSensitivePaths?: boolean
   onRefresh?: () => Promise<{ parsedCount: number; toolCallCount: number; errors: string[] }>
   onSyncStart?: () => SyncStartResult
   getSyncStatus?: () => SyncStatusSnapshot | null
@@ -756,7 +765,10 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
       return
     }
 
-    if (dashboardPassword && shouldProtectApiPath(url.pathname) && !isAuthenticated(dashboardPassword, req.headers.cookie)) {
+    if (options?.redactSensitivePaths) {
+      (res as http.ServerResponse & { [REDACT_PATHS]?: boolean })[REDACT_PATHS] = true
+    }
+    if (dashboardPassword && shouldProtectApiPath(url.pathname, { protectPublicSummary: options?.protectPublicSummary }) && !isAuthenticated(dashboardPassword, req.headers.cookie)) {
       json(res, { error: { code: 'UNAUTHORIZED', message: 'Authentication required' } }, 401)
       return
     }

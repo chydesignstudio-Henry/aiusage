@@ -10,7 +10,7 @@ export interface WidgetSettings {
   showCost: boolean
   showHeatmap: boolean
   showTokenBreakdown: boolean
-  locale: 'en' | 'zh'
+  locale: 'en' | 'zh' | 'zh-TW'
   currency: CurrencyCode
 }
 

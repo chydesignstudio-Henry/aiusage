@@ -11,7 +11,7 @@
 
   export let data: DailyEntry[] = []
   export let showCost: boolean = false
-  export let locale: 'en' | 'zh' = 'en'
+  export let locale: 'en' | 'zh' | 'zh-TW' = 'en'
   export let currency: CurrencyCode = 'USD'
   export let exchangeRate: ExchangeRateState | null = null
 
@@ -147,7 +147,7 @@
   function formatDate(dateStr: string): string {
     const d = dateFromEntry(dateStr)
     return new Intl.DateTimeFormat(locale, {
-      month: locale === 'zh' ? 'numeric' : 'short',
+      month: locale === 'en' ? 'short' : 'numeric',
       day: 'numeric',
     }).format(d)
   }
