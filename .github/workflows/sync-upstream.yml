@@ -18,9 +18,7 @@ on:
 permissions:
   contents: write
   issues: write
-  # Upstream commits often change files under .github/workflows. GitHub
-  # rejects that merge unless the token also has this permission.
-  workflows: write
+
 
 concurrency:
   group: sync-upstream-${{ github.repository }}
