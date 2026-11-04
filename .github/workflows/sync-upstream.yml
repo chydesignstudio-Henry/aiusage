@@ -1,0 +1,234 @@
+# Keep this fork's default branch up to date with its upstream parent.
+#
+# Uses GitHub's merge-upstream API (the same call `gh repo sync` makes first).
+# That API fast-forwards or creates a merge commit. It does not take a force
+# flag, and this workflow never falls back to updating git refs, never passes
+# `--force`, and never force-pushes. Fork-only commits and files stay.
+# A merge conflict fails the job and opens (or comments on) an issue.
+
+name: Sync upstream
+
+on:
+  schedule:
+    # 03:00 Asia/Taipei (UTC+8, no daylight saving time) is 19:00 UTC.
+    # GitHub may start scheduled runs a few minutes late.
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  # Upstream commits often change files under .github/workflows. GitHub
+  # rejects that merge unless the token also has this permission.
+  workflows: write
+
+concurrency:
+  group: sync-upstream-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream into the default branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Sync fork with its parent repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PROMPT_DISABLED: "1"
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # shellcheck shell=bash
+          set -euo pipefail
+
+          resp="$(mktemp)"
+          err="$(mktemp)"
+          body_file="$(mktemp)"
+          trap 'rm -f "$resp" "$err" "$body_file"' EXIT
+
+          is_up_to_date() {
+            local msg
+            msg="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+            case "$msg" in
+              *"already up to date"*|*"already up-to-date"*|*"already synchronized"*|*"already in sync"*|*"no new commits"*|*"no commits to merge"*|*"nothing to merge"*|*"isn't anything to merge"*|*"not behind the upstream"*|*"is up to date"*)
+                return 0
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+
+          valid_repo() {
+            [[ "$1" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          }
+
+          valid_branch() {
+            [[ "$1" =~ ^[A-Za-z0-9._/-]+$ ]] && [[ "$1" != *".."* ]] && [[ "$1" != -* ]] && [[ "$1" != *"@"* ]]
+          }
+
+          append_summary() {
+            local text="$1"
+            if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+              printf '%s\n' "$text" >>"$GITHUB_STEP_SUMMARY"
+            fi
+          }
+
+          open_issue() {
+            local kind="$1"
+            local detail="$2"
+            local title existing
+            if [[ "$kind" == "conflict" ]]; then
+              title="[sync-upstream] 上游合併衝突，已停止且未覆寫"
+            else
+              title="[sync-upstream] 上游同步失敗"
+            fi
+
+            {
+              printf '%s\n' "自動同步沒有完成。這個工作流程**沒有** force-push，也沒有重設分支，分叉自己的提交與新增檔案都還在。"
+              printf '\n'
+              printf '%s\n' "- 分叉：\`${REPO}\`"
+              printf '%s\n' "- 分叉預設分支：\`${branch:-（未知）}\`"
+              printf '%s\n' "- 上游：\`${parent:-（未知）}\`"
+              printf '%s\n' "- 上游預設分支：\`${parent_branch:-（未知）}\`"
+              printf '%s\n' "- 原因：${kind}"
+              printf '%s\n' "- HTTP 狀態：${status:-（無）}"
+              printf '%s\n' "- 執行紀錄：${RUN_URL}"
+              printf '\n'
+              printf '%s\n' "說明："
+              printf '\n'
+              printf '%s\n' '```'
+              printf '%s\n' "$detail"
+              printf '%s\n' '```'
+              printf '\n'
+              printf '%s\n' "請手動把上游合併進預設分支並解決衝突後，再執行「Sync upstream」。不要使用 \`gh repo sync --force\`、\`git push --force\` 或硬重設，那些做法會丟掉這個分叉自己的修改。"
+            } >"$body_file"
+
+            set +e
+            existing="$(
+              gh issue list --repo "$REPO" --state open --limit 100 --json number,title |
+                jq -r --arg t "$title" '[.[] | select(.title == $t)] | .[0].number // empty'
+            )"
+            list_rc=$?
+            if [[ "$list_rc" -ne 0 ]]; then
+              echo "無法列出既有 issue（exit ${list_rc}）。"
+              set -e
+              return 1
+            fi
+            if [[ -n "$existing" ]]; then
+              gh issue comment --repo "$REPO" "$existing" --body-file "$body_file"
+              write_rc=$?
+              echo "Updated issue #${existing}"
+            else
+              gh issue create --repo "$REPO" --title "$title" --body-file "$body_file"
+              write_rc=$?
+            fi
+            set -e
+            return "$write_rc"
+          }
+
+          fail() {
+            local kind="$1"
+            local detail="$2"
+            echo "::error::上游同步失敗（${kind}，HTTP ${status:-none}）。沒有 force-push。"
+            printf '%s\n' "$detail"
+            append_summary "## 上游同步失敗"
+            append_summary ""
+            append_summary "- 上游：\`${parent:-未知}\`（\`${parent_branch:-未知}\`）"
+            append_summary "- 分叉分支：\`${branch:-未知}\`"
+            append_summary "- 原因：${kind}"
+            append_summary "- HTTP：${status:-none}"
+            if ! open_issue "$kind" "$detail"; then
+              echo "::warning::無法建立或更新 issue，請直接看這個失敗的執行紀錄。"
+            fi
+            exit 1
+          }
+
+          if ! meta="$(gh api "repos/${REPO}")"; then
+            status=""
+            parent=""
+            parent_branch=""
+            branch=""
+            fail "error" "無法讀取儲存庫資料（GET /repos/${REPO}）。"
+          fi
+          is_fork="$(jq -r '.fork' <<<"$meta")"
+          parent="$(jq -r '.parent.full_name // empty' <<<"$meta")"
+          parent_branch="$(jq -r '.parent.default_branch // empty' <<<"$meta")"
+          branch="$(jq -r '.default_branch // empty' <<<"$meta")"
+
+          if [[ "$is_fork" != "true" || -z "$parent" ]]; then
+            status=""
+            fail "not-a-fork" "此儲存庫不是 fork，或 API 沒有回傳 parent，無法對上游做 merge-upstream。"
+          fi
+          if ! valid_repo "$parent" || ! valid_repo "$REPO"; then
+            status=""
+            fail "invalid-repo" "上游或分叉的 owner/name 格式不如預期：parent=${parent} repo=${REPO}"
+          fi
+          if ! valid_branch "$branch" || ! valid_branch "$parent_branch"; then
+            status=""
+            fail "invalid-branch" "預設分支名稱不如預期：fork=${branch} upstream=${parent_branch}"
+          fi
+
+          echo "Fork: ${REPO}@${branch}"
+          echo "Upstream parent: ${parent}@${parent_branch}"
+          if [[ "$branch" != "$parent_branch" ]]; then
+            echo "Default branch names differ. merge-upstream still updates ${branch} from the upstream default branch (${parent_branch})."
+          fi
+          echo "POST /repos/${REPO}/merge-upstream — merge or fast-forward only; force is not requested."
+
+          set +e
+          gh api --method POST "repos/${REPO}/merge-upstream" \
+            -f "branch=${branch}" \
+            --include >"$resp" 2>"$err"
+          rc=$?
+          set -e
+
+          status="$(tr -d '\r' <"$resp" | awk 'NR==1 { print $2 }')"
+          body="$(tr -d '\r' <"$resp" | awk 'BEGIN { capture = 0 } capture { print } $0 == "" { capture = 1 }')"
+          message="$(printf '%s' "$body" | jq -r '.message // empty' 2>/dev/null || true)"
+          merge_type="$(printf '%s' "$body" | jq -r '.merge_type // empty' 2>/dev/null || true)"
+          base_branch="$(printf '%s' "$body" | jq -r '.base_branch // empty' 2>/dev/null || true)"
+          if [[ -z "$message" ]]; then
+            message="$(tr -d '\r' <"$err" || true)"
+          fi
+
+          echo "HTTP ${status:-none} (gh exit ${rc})"
+          echo "merge_type=${merge_type:-} base_branch=${base_branch:-}"
+          printf '%s\n' "$message"
+
+          up_to_date="no"
+          if is_up_to_date "$message"; then
+            up_to_date="yes"
+          fi
+
+          detail="$(printf 'HTTP %s\ngh exit %s\nmerge_type=%s\nbase_branch=%s\n\n%s\n' \
+            "${status:-none}" "$rc" "${merge_type:-}" "${base_branch:-}" "$message")"
+
+          # 409 is defined as a merge conflict. Do not treat it as success, and
+          # do not retry with a ref update: that is how a forced overwrite would start.
+          if [[ "$status" == "409" ]]; then
+            fail "conflict" "$detail"
+          fi
+
+          if [[ "$status" == "200" || "$up_to_date" == "yes" ]]; then
+            if [[ "$status" == "200" && "$merge_type" == "fast-forward" ]]; then
+              result="已快轉到上游。這次沒有需要保留的分叉獨有提交擋在前面。"
+            elif [[ "$status" == "200" && -n "$merge_type" && "$merge_type" != "none" ]]; then
+              result="已以合併提交帶入上游（merge_type=${merge_type}）。分叉自己的提交與檔案都保留。"
+            elif [[ "$status" == "200" && -z "$merge_type" && "$up_to_date" != "yes" ]]; then
+              result="上游同步已完成（HTTP 200），但回應沒有 merge_type。分叉自己的提交與檔案都保留。"
+            else
+              result="已與上游一致，沒有新的提交需要合併。"
+            fi
+            echo "$result"
+            append_summary "## 上游同步"
+            append_summary ""
+            append_summary "- 上游：\`${parent}\`（\`${parent_branch}\`）"
+            append_summary "- 分叉分支：\`${branch}\`"
+            append_summary "- 上游基準：\`${base_branch:-${parent}:${parent_branch}}\`"
+            append_summary "- 結果：${result}"
+            exit 0
+          fi
+
+          fail "error" "$detail"
