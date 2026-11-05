@@ -1,11 +1,13 @@
 import type Database from 'better-sqlite3'
-import type { SyncRecord } from '@aiusage/core'
+import type { StatsRecord, SyncRecord } from '@aiusage/core'
 import {
   backfillUnknownDeviceInstanceId,
+  clearSyncRecordState,
   getUnsyncedRecords,
   isUploadableLocalRecord,
-  markRecordsSynced,
+  markRecordVersionsSynced,
   repairRecordProvenance,
+  unretirePublishedWireIds,
 } from '../db/records.js'
 import {
   deleteSyncedRecord,
@@ -19,6 +21,7 @@ import {
 } from '../db/synced-records.js'
 import {
   clearRetiredWireIds,
+  DELETED_LOCAL_ROWS,
   getClaimedOwners,
   getRetiredWireIds,
   nextSyncTick,
@@ -27,6 +30,7 @@ import {
   withdrawNamespaceVerdict,
 } from '../db/sync-claims.js'
 import { mapStatsRecordToSyncRecord } from './mapper.js'
+import { cloudRecordProblem, toCloudRecord } from './cloud-dto.js'
 import { cloudPush, cloudPull, CloudSyncError, type CloudPulledTombstone } from './cloud.js'
 import type { SyncProgress } from './runtime.js'
 
@@ -47,6 +51,12 @@ export interface CloudSyncResult {
   pulledCount: number
   uploadedCount: number
   mergedCount: number
+  /**
+   * The server generation this target's upload acknowledgements
+   * (`sync_record_state`) belong to: the one the pull observed or, when the
+   * sync failed before it could act on that, the one passed to `sync()`. The
+   * caller stores it and passes it to the next `sync()`.
+   */
   syncGeneration: number
   /**
    * Pulled rows removed because the cloud no longer carries them (a tombstone
@@ -57,6 +67,18 @@ export interface CloudSyncResult {
   prunedCount?: number
   /** Wire ids this device retracted from the server (see migration v14). */
   retiredCount?: number
+  /**
+   * Local records not uploaded because the cloud cannot store them (see
+   * `cloudRecordProblem`) or because the server did not store them. They
+   * are not acknowledged: they stay local, count as unsynced and go out
+   * again with the next sync, by then possibly corrected by a re-parse.
+   */
+  rejectedCount?: number
+  /**
+   * Retired wire ids (see `retiredCount`) whose tombstones the server did not
+   * apply. They stay queued and go out again with the next sync.
+   */
+  unretiredCount?: number
   error?: string
 }
 
@@ -77,7 +99,16 @@ export class CloudSyncOrchestrator {
     return this.options.target ?? 'cloud'
   }
 
+  /**
+   * `syncGeneration` is the server generation this target last synced under
+   * (`CloudSyncResult.syncGeneration` of the previous sync). An installation
+   * that never stored one passes nothing: every dataset starts at generation
+   * 1, so acknowledgements of unknown age are valid exactly while the server
+   * is still there.
+   */
   async sync(syncGeneration: number = 1): Promise<CloudSyncResult> {
+    // The generation the acknowledgements in `sync_record_state` belong to.
+    let ackGeneration = syncGeneration
     try {
       // Step 0: provenance guard — rows stamped with another device's id are
       // never local, whatever their source_file says — then adopt pre-init rows.
@@ -166,15 +197,21 @@ export class CloudSyncOrchestrator {
       // Both go out under the generation the pull just observed: after the
       // server's data was cleared (`aiusage clean --all`) the generation the
       // caller knew about is stale and every push under it would be rejected.
+      //
+      // A generation other than the one last synced under is a dataset this
+      // device has uploaded nothing to: the server starts a new, empty one
+      // when the cloud data is cleared. What the previous one acknowledged
+      // says nothing about it, so those acknowledgements go and the whole
+      // local history is pushed again. From here on the acknowledgements
+      // belong to the new generation, also when a push below fails.
       this.options.onProgress?.({ phase: 'uploading', pulledCount: insertedCount })
-      const uploadedCount = await this.push(pullResult.syncGeneration)
-      const retiredCount = await this.pushRetiredIds(pullResult.syncGeneration)
-
-      // Step 5: Mark local records as synced
-      const unsynced = this.getUploadableRecords(this.target)
-      if (unsynced.length > 0) {
-        markRecordsSynced(this.db, unsynced.map(r => r.id), Date.now(), this.target)
+      if (pullResult.syncGeneration !== ackGeneration) {
+        clearSyncRecordState(this.db, this.target)
+        ackGeneration = pullResult.syncGeneration
       }
+      // Each batch is marked as synced once the server accepted it (see `push`).
+      const { uploadedCount, rejectedCount } = await this.push(pullResult.syncGeneration)
+      const { retiredCount, unretiredCount } = await this.pushRetiredIds(pullResult.syncGeneration)
 
       this.options.onProgress?.({
         phase: 'finalizing',
@@ -190,6 +227,8 @@ export class CloudSyncOrchestrator {
         syncGeneration: pullResult.syncGeneration,
         prunedCount,
         retiredCount,
+        ...(rejectedCount > 0 ? { rejectedCount } : {}),
+        ...(unretiredCount > 0 ? { unretiredCount } : {}),
       }
     } catch (error) {
       const message = error instanceof CloudSyncError ? error.message
@@ -201,7 +240,7 @@ export class CloudSyncOrchestrator {
         pulledCount: 0,
         uploadedCount: 0,
         mergedCount: 0,
-        syncGeneration,
+        syncGeneration: ackGeneration,
         error: message,
       }
     }
@@ -266,38 +305,99 @@ export class CloudSyncOrchestrator {
       .filter(record => isUploadableLocalRecord(record, deviceInstanceId))
   }
 
-  private async push(syncGeneration: number): Promise<number> {
+  /**
+   * Push every unsynced local record and return how many the server stored
+   * and how many it did not. Exactly the versions that were read here are
+   * acknowledged, batch by batch as the server accepts them: a record
+   * inserted or rewritten while a request is in flight was not sent and stays
+   * unsynced, and a failure in a later batch leaves only the batches from
+   * there on to send again.
+   *
+   * Only what the server stored, or already holds in the same or a newer
+   * version, is acknowledged. A record the cloud cannot store is not sent,
+   * and one the server reports as rejected is left unsynced, so neither is
+   * taken for synced while the cloud does not have it.
+   */
+  private async push(syncGeneration: number): Promise<{ uploadedCount: number; rejectedCount: number }> {
     const unsynced = this.getUploadableRecords(this.target)
-    if (unsynced.length === 0) {
-      return 0
+    let uploadedCount = 0
+    let rejectedCount = 0
+
+    for (let i = 0; i < unsynced.length; i += BATCH_SIZE) {
+      const sendable: Array<{ local: StatsRecord; wire: SyncRecord }> = []
+      for (const local of unsynced.slice(i, i + BATCH_SIZE)) {
+        const wire = mapStatsRecordToSyncRecord(local)
+        if (cloudRecordProblem(toCloudRecord(wire))) rejectedCount++
+        else sendable.push({ local, wire })
+      }
+      if (sendable.length === 0) continue
+      const result = await cloudPush(sendable.map(r => r.wire), [], this.options.deviceInstanceId, syncGeneration)
+      const rejected = new Set(result.rejectedIds ?? [])
+      const stored = sendable.filter(r => !rejected.has(r.wire.id))
+      markRecordVersionsSynced(this.db, stored.map(r => r.local), this.target)
+      uploadedCount += stored.length
+      rejectedCount += sendable.length - stored.length
     }
 
-    // Convert to SyncRecord format
-    const syncRecords = unsynced.map(mapStatsRecordToSyncRecord)
-
-    for (let i = 0; i < syncRecords.length; i += BATCH_SIZE) {
-      const batch = syncRecords.slice(i, i + BATCH_SIZE)
-      await cloudPush(batch, [], this.options.deviceInstanceId, syncGeneration)
-    }
-
-    return unsynced.length
+    return { uploadedCount, rejectedCount }
   }
 
   /**
    * The cloud store is upsert-only, so wire ids this device will never publish
-   * again (migration v14: Antigravity/Trae records re-keyed to their parser
-   * ids) are retracted with tombstones. Each batch is forgotten locally only
-   * once the server accepted it, so an interrupted sync retries the rest.
+   * again are retracted with tombstones: the ones queued for this target
+   * (migration v14: Antigravity/Trae records re-keyed to their parser ids; a
+   * parse that deleted rows this target had acknowledged) and the ones of
+   * every local row a parse deleted (`DELETED_LOCAL_ROWS`), which covers a
+   * row that was uploaded without an acknowledgement the delete could see.
+   * This runs after `push`, so an upload that read such a row before it was
+   * deleted has gone out before its tombstone.
+   *
+   * An id is forgotten locally, under both keys, only once the server applied
+   * its tombstone, so an interrupted sync retries the rest, and one the
+   * server reports as rejected is kept and sent again with the next sync. An
+   * id the cloud cannot hold (empty, or with a NUL, which PostgreSQL text
+   * cannot store) has no cloud record to retract: it is forgotten without
+   * being sent.
+   *
+   * Every batch is read from the queue as it is then, in the same transaction
+   * that first forgets, instead of retracting, every id a local row is
+   * published under (`unretirePublishedWireIds`): `push` has just uploaded
+   * that row, or a parse queued the id, wrote the row or stored it again
+   * while an earlier request was pending.
    */
-  private async pushRetiredIds(syncGeneration: number): Promise<number> {
-    const retired = getRetiredWireIds(this.db, this.target)
-    if (retired.length === 0) return 0
-    const now = Date.now()
-    for (let i = 0; i < retired.length; i += BATCH_SIZE) {
-      const batch = retired.slice(i, i + BATCH_SIZE)
-      await cloudPush([], batch.map(record_id => ({ record_id, updatedAt: now })), this.options.deviceInstanceId, syncGeneration)
-      clearRetiredWireIds(this.db, this.target, batch)
+  private async pushRetiredIds(syncGeneration: number): Promise<{ retiredCount: number; unretiredCount: number }> {
+    let retiredCount = 0
+    let unretiredCount = 0
+    const storable = (id: string): boolean => id !== '' && !id.includes('\u0000')
+    // Each id is sent at most once per sync, so one the server rejected
+    // waits for the next sync instead of being read again here.
+    const sent = new Set<string>()
+    const unsent = (): string[] => {
+      const queued = Array.from(new Set([...getRetiredWireIds(this.db, this.target), ...getRetiredWireIds(this.db, DELETED_LOCAL_ROWS)]))
+      const unstorable = queued.filter(id => !storable(id))
+      clearRetiredWireIds(this.db, this.target, unstorable)
+      clearRetiredWireIds(this.db, DELETED_LOCAL_ROWS, unstorable)
+      return queued.filter(id => storable(id) && !sent.has(id))
     }
-    return retired.length
+    // The live ids are checked and the batch is read in one transaction, so
+    // no parse can queue, publish or store an id in between. The local rows
+    // are read only when something is left to send.
+    const nextBatch = this.db.transaction((): string[] => {
+      if (unsent().length === 0) return []
+      unretirePublishedWireIds(this.db, this.target, this.options.deviceInstanceId)
+      return unsent().slice(0, BATCH_SIZE)
+    })
+    for (let batch = nextBatch.immediate(); batch.length > 0; batch = nextBatch.immediate()) {
+      for (const id of batch) sent.add(id)
+      const now = Date.now()
+      const result = await cloudPush([], batch.map(record_id => ({ record_id, updatedAt: now })), this.options.deviceInstanceId, syncGeneration)
+      const rejected = new Set(result.rejectedTombstoneIds ?? [])
+      const applied = batch.filter(id => !rejected.has(id))
+      clearRetiredWireIds(this.db, this.target, applied)
+      clearRetiredWireIds(this.db, DELETED_LOCAL_ROWS, applied)
+      retiredCount += applied.length
+      unretiredCount += batch.length - applied.length
+    }
+    return { retiredCount, unretiredCount }
   }
 }

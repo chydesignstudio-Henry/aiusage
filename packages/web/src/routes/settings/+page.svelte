@@ -24,6 +24,7 @@
   let kelivoImportError = ''
   let kelivoImportedCount = null
   let kelivoAddedCount = null
+  let kelivoImportWarnings = []
 
   const PLATFORM_LABEL = { darwin: 'macOS', win32: 'Windows', linux: 'Linux' }
 
@@ -44,16 +45,11 @@
   let cloudSyncAvailable = true
   let syncPollTimer = null
 
-  $: currentSyncTarget = syncData.backend === 'cloud'
-    ? 'cloud'
-    : syncData.backend === 'github' && syncData.repo
-      ? `github:${syncData.repo}`
-      : syncData.backend === 's3' && syncData.bucket
-        ? `s3:${syncData.bucket}`
-        : ''
-  $: displayedSyncStatus = !syncStatusData?.lastSyncTarget || !currentSyncTarget || syncStatusData.lastSyncTarget === currentSyncTarget
-    ? syncStatusData
-    : null
+  // The status is the one the server reports for the configured target: it
+  // already selects it, and only it knows the target key (`s3:<bucket>` plus
+  // the prefix and endpoint, `github:<repo>` plus the branch). Rebuilding the
+  // key here from the form never matched a custom configuration and hid a
+  // sync that had run — see settings-sync-status.test.ts.
 
   // GitHub credential state
   let ghToken = ''
@@ -495,7 +491,13 @@
     const file = event.target.files?.[0]
     event.target.value = ''
     if (!file) return
-    if (file.name !== 'chats.json' && !file.name.toLowerCase().endsWith('.zip')) {
+    const lowerName = file.name.toLowerCase()
+    const accepted = lowerName === 'chats.json'
+      || lowerName.endsWith('.zip')
+      || lowerName.endsWith('.db')
+      || lowerName.endsWith('.sqlite')
+      || lowerName.endsWith('.sqlite3')
+    if (!accepted) {
       kelivoImportError = $t('settings.kelivoInvalidFile')
       return
     }
@@ -504,10 +506,12 @@
     kelivoImportError = ''
     kelivoImportedCount = null
     kelivoAddedCount = null
+    kelivoImportWarnings = []
     try {
       const result = await importKelivoBackup(file)
       kelivoImportedCount = result.imported ?? 0
       kelivoAddedCount = result.added ?? null
+      kelivoImportWarnings = Array.isArray(result.warnings) ? result.warnings : []
       let nextTools = detectedTools
       try {
         const toolsResult = await fetchDetectedTools()
@@ -629,7 +633,7 @@
         <div class="source-group">
           <div class="source-subtitle">{$t('settings.manualImports')}</div>
           <div class="field-hint">{$t('settings.manualImportsHint')}</div>
-          <input class="file-input" type="file" accept=".zip,.json,application/zip,application/json" bind:this={kelivoFileInput} on:change={handleKelivoFileChange} />
+          <input class="file-input" type="file" accept=".zip,.json,.db,.sqlite,.sqlite3,application/zip,application/json,application/vnd.sqlite3,application/x-sqlite3" bind:this={kelivoFileInput} on:change={handleKelivoFileChange} />
           <div class="detected-tools-list">
             {#each manualImportTools as tool}
               <div class="detected-tool">
@@ -659,6 +663,14 @@
                     {/if}
                   </div>
                   {#if kelivoImportError}<p class="section-error compact">{kelivoImportError}</p>{/if}
+                  {#if kelivoImportWarnings.length}
+                    <div class="import-warning">
+                      <span>{$t('settings.kelivoImportIncomplete')}</span>
+                      {#each kelivoImportWarnings as warning}
+                        <div>{warning}</div>
+                      {/each}
+                    </div>
+                  {/if}
                 {/if}
               </div>
             {/each}
@@ -912,7 +924,7 @@
           <div class="sync-status-grid">
             <div class="sync-status-item">
               <span class="sync-status-label">{$t('settings.syncLastSync')}</span>
-              <span class="sync-status-value mono">{formatSyncTime(displayedSyncStatus?.lastSyncAt)}</span>
+              <span class="sync-status-value mono">{formatSyncTime(syncStatusData?.lastSyncAt)}</span>
             </div>
             {#if syncStatusData?.nextSyncAt}
               <div class="sync-status-item">
@@ -922,55 +934,55 @@
             {/if}
             <div class="sync-status-item">
               <span class="sync-status-label">{$t('settings.syncStatusLabel')}</span>
-              <span class="sync-status-value" class:ok={displayedSyncStatus?.lastSyncStatus === 'ok'} class:err={displayedSyncStatus?.lastSyncStatus === 'failed'}>
+              <span class="sync-status-value" class:ok={syncStatusData?.lastSyncStatus === 'ok'} class:err={syncStatusData?.lastSyncStatus === 'failed'}>
                 {#if syncRunning}
                   {syncStatusData?.phase ? $t(`sync.phase.${syncStatusData.phase}`) : $t('sync.syncing')}
-                {:else if displayedSyncStatus?.lastSyncStatus === 'ok'}
+                {:else if syncStatusData?.lastSyncStatus === 'ok'}
                   {$t('sync.complete')}
-                {:else if displayedSyncStatus?.lastSyncStatus}
+                {:else if syncStatusData?.lastSyncStatus}
                   {$t('sync.failed')}
                 {:else}
                   —
                 {/if}
               </span>
             </div>
-            {#if displayedSyncStatus?.lastSyncPulled != null && displayedSyncStatus?.lastSyncStatus === 'ok'}
+            {#if syncStatusData?.lastSyncPulled != null && syncStatusData?.lastSyncStatus === 'ok'}
               <div class="sync-status-item">
                 <span class="sync-status-label">{$t('settings.syncPulled')}</span>
-                <span class="sync-status-value mono">{displayedSyncStatus.lastSyncPulled}</span>
+                <span class="sync-status-value mono">{syncStatusData.lastSyncPulled}</span>
               </div>
               <div class="sync-status-item">
                 <span class="sync-status-label">{$t('settings.syncUploaded')}</span>
-                <span class="sync-status-value mono">{displayedSyncStatus.lastSyncUploaded ?? 0}</span>
+                <span class="sync-status-value mono">{syncStatusData.lastSyncUploaded ?? 0}</span>
               </div>
             {/if}
-            {#if displayedSyncStatus?.lastSyncError && displayedSyncStatus?.lastSyncStatus !== 'ok'}
+            {#if syncStatusData?.lastSyncError && syncStatusData?.lastSyncStatus !== 'ok'}
               <div class="sync-status-item full">
                 <span class="sync-status-label">{$t('settings.syncError')}</span>
                 <span class="sync-status-value err">
-                  {#if displayedSyncStatus.lastSyncError.includes('CLOUD_SYNC_DISABLED') || displayedSyncStatus.lastSyncError.includes('currently unavailable')}
+                  {#if syncStatusData.lastSyncError.includes('CLOUD_SYNC_DISABLED') || syncStatusData.lastSyncError.includes('currently unavailable')}
                     {$t('settings.cloudUnavailable')}
-                  {:else if displayedSyncStatus.lastSyncError.includes('USER_CLOUD_BANNED') || displayedSyncStatus.lastSyncError.includes('disabled by an administrator')}
+                  {:else if syncStatusData.lastSyncError.includes('USER_CLOUD_BANNED') || syncStatusData.lastSyncError.includes('disabled by an administrator')}
                     {$t('settings.cloudBanned')}
-                  {:else if displayedSyncStatus.lastSyncError.includes('star') || displayedSyncStatus.lastSyncError.includes('Star') || displayedSyncStatus.lastSyncError.includes('STAR_REQUIRED')}
+                  {:else if syncStatusData.lastSyncError.includes('star') || syncStatusData.lastSyncError.includes('Star') || syncStatusData.lastSyncError.includes('STAR_REQUIRED')}
                     {$t('settings.syncStarRequired')}
                     <a href="https://github.com/juliantanx/aiusage" target="_blank" rel="noopener noreferrer" class="cloud-step-link">{$t('settings.syncCloudStep2')}</a>
-                  {:else if displayedSyncStatus.lastSyncError.includes('bind') || displayedSyncStatus.lastSyncError.includes('GitHub') || displayedSyncStatus.lastSyncError.includes('GITHUB_BINDING')}
+                  {:else if syncStatusData.lastSyncError.includes('bind') || syncStatusData.lastSyncError.includes('GitHub') || syncStatusData.lastSyncError.includes('GITHUB_BINDING')}
                     {$t('settings.syncGithubBindingRequired')}
                     <a href="https://aiusage.jtanx.com/settings#accounts" target="_blank" rel="noopener noreferrer" class="cloud-step-link">{$t('settings.syncCloudStep1')}</a>
                   {:else}
-                    {displayedSyncStatus.lastSyncError}
+                    {syncStatusData.lastSyncError}
                   {/if}
                 </span>
               </div>
             {/if}
-            {#if displayedSyncStatus?.lastSyncDurationMs != null && displayedSyncStatus?.lastSyncStatus === 'ok'}
+            {#if syncStatusData?.lastSyncDurationMs != null && syncStatusData?.lastSyncStatus === 'ok'}
               <div class="sync-status-item">
                 <span class="sync-status-label">{$t('settings.syncDuration')}</span>
-                <span class="sync-status-value mono">{(displayedSyncStatus.lastSyncDurationMs / 1000).toFixed(1)}s</span>
+                <span class="sync-status-value mono">{(syncStatusData.lastSyncDurationMs / 1000).toFixed(1)}s</span>
               </div>
             {/if}
-            {#if displayedSyncStatus?.lastSyncPulled != null && displayedSyncStatus?.lastSyncStatus === 'ok'}
+            {#if syncStatusData?.lastSyncPulled != null && syncStatusData?.lastSyncStatus === 'ok'}
               <div class="sync-status-hint">{$t('settings.syncCountHint')}</div>
             {/if}
           </div>
@@ -1113,6 +1125,12 @@
     color: var(--rose);
   }
   .section-error.compact { margin: 0.5rem 0 0 1.25rem; }
+
+  .import-warning {
+    margin: 0.5rem 0 0 1.25rem;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+  }
 
   .section-footer {
     display: flex;

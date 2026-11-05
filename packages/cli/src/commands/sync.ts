@@ -1,13 +1,14 @@
 import { join } from 'node:path'
 import type Database from 'better-sqlite3'
-import { getState, setSyncTargetState } from '../init.js'
+import { getState, readStateFile, setSyncTargetState } from '../init.js'
 import { SyncOrchestrator, type SyncBackend, type SyncResult } from '../sync/index.js'
 import { CloudSyncOrchestrator, type CloudSyncResult } from '../sync/cloud-orchestrator.js'
 import { verifyConsent } from '../sync/consent.js'
 import { GitSyncBackend } from '../sync/git.js'
 import { S3SyncBackend } from '../sync/s3.js'
-import { loadConfig, buildConsentConfig, loadCredential, AIUSAGE_DIR } from '../config.js'
+import { loadConfig, readConfigFile, buildConsentConfig, loadCredential, AIUSAGE_DIR } from '../config.js'
 import { hasCredentials } from '../leaderboard/credentials.js'
+import { acquireCloudSyncLock } from '../sync/cloud-lock.js'
 import type { SyncProgress } from '../sync/runtime.js'
 import { adoptLegacySyncTarget, getLegacySyncTarget, getSyncTarget, knownSyncTargets, otherSyncTargets } from '../sync/target.js'
 import { forgetSyncTarget, repairSyncContamination, type ForgetTargetReport, type RepairReport } from '../sync/repair.js'
@@ -65,6 +66,13 @@ function failedResult(error: string): SyncResult {
   return { status: 'failed', pulledCount: 0, uploadedCount: 0, mergedCount: 0, error }
 }
 
+/** Why `getState` returned nothing: `state.json` is missing, or cannot be used. */
+function unusableStateMessage(): string {
+  const stateFile = readStateFile(AIUSAGE_DIR)
+  if (stateFile.status === 'invalid') return stateFile.error.message
+  return `Device identity not initialised: ${join(AIUSAGE_DIR, 'state.json')} is missing. Run "aiusage status" to create it, then sync again.`
+}
+
 function blockedResult(error: string): SyncResult {
   return { status: 'blocked_pending_consent', pulledCount: 0, uploadedCount: 0, mergedCount: 0, error }
 }
@@ -96,9 +104,17 @@ export type RunSyncResult = (SyncResult | CloudSyncResult) & {
 
 export async function runSync(
   db: Database.Database,
-  options?: { onProgress?: (progress: SyncProgress) => void },
+  options?: {
+    onProgress?: (progress: SyncProgress) => void
+    /** Told the target key this run syncs, once the configuration has been read. */
+    onTarget?: (target: string) => void
+  },
 ): Promise<RunSyncResult> {
-  const config = loadConfig()
+  const configFile = readConfigFile()
+  if (configFile.status === 'invalid') {
+    return failedResult(configFile.error.message)
+  }
+  const config = configFile.status === 'ok' ? configFile.config : null
   if (!config?.sync) {
     return failedResult('Sync not configured. Run "aiusage init" first.')
   }
@@ -107,10 +123,20 @@ export async function runSync(
   if (!target) {
     return failedResult('Invalid sync configuration.')
   }
+  options?.onTarget?.(target)
+  // Syncing needs this device's identity, and nothing here may invent one: a
+  // new id next to an existing database makes the device's own history look
+  // like another device's.
+  if (!getState(AIUSAGE_DIR)) {
+    return failedResult(unusableStateMessage())
+  }
   // A configuration whose key changed (non-default branch/prefix/endpoint)
   // takes over what was recorded under its old key before anything reads it.
   adoptLegacySyncTarget(AIUSAGE_DIR, db, config.sync)
   const state = getState(AIUSAGE_DIR)
+  if (!state) {
+    return failedResult(unusableStateMessage())
+  }
 
   // Cloud sync doesn't use consent system — it uses device auth (HMAC)
   if (config.sync.backend === 'cloud') {
@@ -118,32 +144,47 @@ export async function runSync(
       return failedResult('Not logged in. Run "aiusage login" first.')
     }
 
-    const orchestrator = new CloudSyncOrchestrator(db, {
-      deviceInstanceId: state!.deviceInstanceId,
-      target,
-      knownTargets: knownSyncTargets(state, target),
-      onProgress: options?.onProgress,
-    })
+    // One cloud sync at a time per installation (`serve` and `aiusage sync`
+    // are separate processes). The upload acknowledgements in the database
+    // and the generation in `state.json` they belong to are one piece of
+    // state: a run that clears them for a new generation must not have an
+    // older run's delayed acknowledgement land among them afterwards.
+    const releaseLock = acquireCloudSyncLock(AIUSAGE_DIR)
+    if (!releaseLock) {
+      return failedResult('Another cloud sync is running on this device. Try again when it has finished.')
+    }
+    try {
+      const orchestrator = new CloudSyncOrchestrator(db, {
+        deviceInstanceId: state.deviceInstanceId,
+        target,
+        knownTargets: knownSyncTargets(state, target),
+        onProgress: options?.onProgress,
+      })
 
-    const startedAt = Date.now()
-    const result = await orchestrator.sync()
+      const startedAt = Date.now()
+      // Read under the lock: the previous run stores it just before releasing.
+      const result = await orchestrator.sync(getState(AIUSAGE_DIR)?.syncTargets?.[target]?.syncGeneration)
 
-    const now = Date.now()
-    setSyncTargetState(AIUSAGE_DIR, target, {
-      lastSyncAt: now,
-      lastSyncStatus: result.status === 'ok' ? 'ok' : 'failed',
-      lastSyncError: result.error,
-      lastSyncUploaded: result.uploadedCount,
-      lastSyncPulled: result.pulledCount,
-      lastSyncDurationMs: now - startedAt,
-    })
+      const now = Date.now()
+      setSyncTargetState(AIUSAGE_DIR, target, {
+        lastSyncAt: now,
+        lastSyncStatus: result.status === 'ok' ? 'ok' : 'failed',
+        lastSyncError: result.error,
+        lastSyncUploaded: result.uploadedCount,
+        lastSyncPulled: result.pulledCount,
+        lastSyncDurationMs: now - startedAt,
+        syncGeneration: result.syncGeneration,
+      })
 
-    return result
+      return result
+    } finally {
+      releaseLock()
+    }
   }
 
   // GitHub/S3 sync uses consent system
-  const consent = state?.syncConsents?.[target]
-    ?? (state?.lastSyncTarget === target && state.syncConsentAt && state.syncConsentTarget
+  const consent = state.syncConsents?.[target]
+    ?? (state.lastSyncTarget === target && state.syncConsentAt && state.syncConsentTarget
       ? { syncConsentAt: state.syncConsentAt, syncConsentTarget: state.syncConsentTarget }
       : null)
   if (!consent?.syncConsentAt || !consent?.syncConsentTarget) {
@@ -167,7 +208,7 @@ export async function runSync(
   }
 
   const orchestrator = new SyncOrchestrator(db, backend, {
-    deviceInstanceId: state!.deviceInstanceId,
+    deviceInstanceId: state.deviceInstanceId,
     target,
     consentVerified: true,
     knownTargets: knownSyncTargets(state, target),
@@ -238,7 +279,7 @@ export async function runSyncRepair(
   adoptLegacySyncTarget(AIUSAGE_DIR, db, config.sync)
   const state = getState(AIUSAGE_DIR)
   if (!state?.deviceInstanceId) {
-    return { status: 'failed', error: 'Device identity not initialised. Run "aiusage init" first.' }
+    return { status: 'failed', error: unusableStateMessage() }
   }
 
   if (options.forgetTarget !== undefined) {

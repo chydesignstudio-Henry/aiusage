@@ -9,6 +9,139 @@
 
 ---
 
+## [1.5.28] - 2026-11-04
+
+本版本提高小组件 USD/CNY 汇率获取的可用性，包含 [@cahthuranag](https://github.com/cahthuranag) 贡献的 [#154](https://github.com/juliantanx/aiusage/pull/154)。
+
+### 修复
+- **唯一的汇率源不可用时，小组件无法刷新汇率**（[#154](https://github.com/juliantanx/aiusage/pull/154)，由 [@cahthuranag](https://github.com/cahthuranag) 贡献） — 现在依次尝试 jsDelivr、currency-api.pages.dev 和 allratestoday.com。网络错误、HTTP 失败或缺失、无效的 CNY 汇率都会触发下一源；成功响应的来源 URL 会保存在汇率缓存中。
+- **汇率源卡住时阻塞所有备用源** — 每个源现在有 5 秒超时，覆盖响应头和完整 JSON 响应体的读取。超时后取消请求并尝试下一源。新增回归测试覆盖响应头与响应体卡住、所有源超时及定时器清理。
+
+---
+
+## [1.5.27] - 2026-11-02
+
+本版本修复设置页在使用自定义 S3 端点、前缀或非默认 GitHub 分支时显示错误的上次同步状态，包含 [@Fiveo9](https://github.com/Fiveo9) 贡献的 [#153](https://github.com/juliantanx/aiusage/pull/153)。
+
+### 修复
+- **同步成功后，设置页仍把“上次同步”显示为“从未”**（[#153](https://github.com/juliantanx/aiusage/pull/153)，由 [@Fiveo9](https://github.com/Fiveo9) 贡献） — 同步状态区会用表单拼出的同步目标键与状态里的 `lastSyncTarget` 比较，不一致就把整个状态当成空，显示“从未”。表单拼出的键没有包含 S3 的前缀与端点、以及 GitHub 的分支，而这些字段从 1.5.18 起已属于目标键（`s3:usage?endpoint=...`）：使用自定义端点（Cloudflare R2、MinIO）或非默认分支的配置永远匹配不上，即使同步成功也一直显示“从未”，也看不到上传统计。它读取的又是表单而不是已保存的配置，因此在保存前编辑仓库或存储桶也会让状态变为空。现在页面直接显示服务端为当前配置目标返回的状态：目标由服务端选定，也只有它知道完整的目标键。
+
+---
+
+## [1.5.26] - 2026-10-22
+
+本版本修复看板总量滞后和轮询生命周期问题，使站点通过 TypeScript 检查，并清理仓库及 Docker 构建配置，包含 [@aaroncchung](https://github.com/aaroncchung) 贡献的 [#149](https://github.com/juliantanx/aiusage/pull/149)、[#150](https://github.com/juliantanx/aiusage/pull/150) 和 [#151](https://github.com/juliantanx/aiusage/pull/151)。
+
+### 变更
+- **站点通过 `tsc --noEmit` 类型检查**（[#149](https://github.com/juliantanx/aiusage/pull/149)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — `packages/site` 的类型检查原有 122 个错误，几乎都是因为数据库客户端被声明成单纯的查询函数：编译器认为 `sql.begin` 不存在，事务句柄也被声明成查询结果的类型。现在客户端和事务句柄使用 postgres.js 自身的类型，查询结果通过查询的类型参数获得行类型，不再使用类型断言，其余少数参数和类型谓词错误也已修正。站点现在没有类型错误。此改动只涉及类型，运行时行为不变。保持零错误的 CI 检查将另行提交。
+- **仓库整理**（[#150](https://github.com/juliantanx/aiusage/pull/150)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 误提交的 pnpm store 索引（`.pnpm-store/`）不再纳入版本控制，并已加入忽略列表。CLI 的 Docker 镜像改为预先准备 `pnpm@9.15.0`（即 `packageManager` 指定、构建时实际一直使用的版本），不再在每次构建时下载用不到的 `pnpm@latest`。站点中的 `db:seed` 脚本指向一个从未存在过的 `seed.ts`，现已删除。
+
+### 修复
+- **概览和首页显示的是最近一次刷新之前的总量**（[#151](https://github.com/juliantanx/aiusage/pull/151)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 看板把汇总接口的响应存在缓存里，并一直返回缓存中的旧副本；后台取回的新副本只会替换缓存，从未显示出来。概览页会先解析新日志再重新加载，但显示的仍是刷新之前的总量（与 Token、费用和模型页面不一致）；首页的每次轮询以及第一次点击“立即刷新”显示的也都是上一次的结果。现在汇总响应不再缓存，每次加载都显示本地服务当时的数据。概览页在刷新后重新加载时保留当前数字，不再闪现加载状态。
+- **冷启动打开 `/` 时首页被挂载两次，并留下一个持续运行的轮询**（[#151](https://github.com/juliantanx/aiusage/pull/151)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 看板的鉴权检查完成时，布局会重新创建页面；第一个仍在加载中的副本在已被销毁之后才启动倒计时和对 `/api/home-summary` 的轮询，两者会在所有页面上一直运行到标签页关闭；在轮询请求尚未返回时离开首页也会出现同样的问题。现在公开首页和完整看板共用同一个页面实例，首页只挂载一次（在首页解锁看板后仍会重新加载一次，以读取锁定时无权访问的设置和配额），离开首页后也不会再启动任何定时器或监听器。
+
+---
+
+## [1.5.25] - 2026-10-22
+
+本版本补回多个 AI 工具导入器遗漏的用量、防止重复统计，并让 Windows 上的损坏数据库恢复更加安全，包含 [@aaroncchung](https://github.com/aaroncchung) 贡献的 [#145](https://github.com/juliantanx/aiusage/pull/145)、[#146](https://github.com/juliantanx/aiusage/pull/146)、[#147](https://github.com/juliantanx/aiusage/pull/147) 和 [#148](https://github.com/juliantanx/aiusage/pull/148)。
+
+### 修复
+- **Antigravity 对话最后一次生成之后的用量从未被导入**（[#148](https://github.com/juliantanx/aiusage/pull/148)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 序号大于最后一次生成所关联的最大步骤序号的步骤不属于任何生成窗口，其中记录的用量（例如最终回复之后的辅助模型调用）会被丢弃，除非之后又出现新的生成。现在这些步骤归入最后一个已完成的生成，并在每次导入时重新读取，因此对话首次导入之后才写入的用量也会被导入。记录的 ID 保持不变：之后出现的生成覆盖这些步骤时会原地更新记录，未变化的步骤重新读取后也不会再次上传。生成所关联步骤之后的用量不会让该生成被视为已完成。升级前已导入的对话会在下次解析时补上缺失的用量，无需重新导入。
+- **Windows 上无法恢复损坏的数据库，恢复后的数据库也找不回历史数据**（[#147](https://github.com/juliantanx/aiusage/pull/147)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 缓存以 `SQLITE_CORRUPT` 或 `SQLITE_NOTADB` 打开失败时，文件会在仍被打开的状态下被删除，这在 Windows 上会失败；该错误被忽略，此后每条命令都会失败，直到用户手动删除文件。在所有平台上，`watermark.json` 中解析器的读取位置都会保留下来，因此新数据库会跳过所有已读过的日志。现在损坏的数据库会先被关闭，再连同其 `-wal`、`-shm` 和 `-journal` 文件一起改名为 `cache.db.corrupt-<时间>` 移到一旁，而不是被删除，因为其中可能有日志已不存在的用量数据。`watermark.json` 会被重置，下一次解析会重新导入所有日志。如果数据库无法移走（例如仍被另一个 aiusage 进程打开），会报告错误，所有文件保持原样。
+- **Kilo 与 OpenCode 的导入互相跳过对方的消息**（[#146](https://github.com/juliantanx/aiusage/pull/146)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — Kilo 数据库导入从 OpenCode 的游标开始读取，并把自己的位置写回该游标，因此同时存在 `kilo.db` 和 `opencode.db` 时，每次运行都会把共用的游标移过另一方尚未读取的消息。现在 Kilo 使用自己的游标，并会从头读取一次 `kilo.db`；升级后也会从头读取一次 `opencode.db`，以补回被跳过的消息。记录保持原有 id，已导入的行会原地更新。
+- **Cursor、Goose、Hermes、OpenCode 和 Kilo 在首次导入后增长的用量从未被统计**（[#146](https://github.com/juliantanx/aiusage/pull/146)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 这些导入在第一次看到某个会话、对话或消息时就把游标移过它，而它的 token 数仍在增长：Cursor 对话后来新增的气泡、Goose 会话之后累计的总量、导入时仍在进行的 Hermes 会话的最终用量，以及 OpenCode 或 Kilo 回复结束时才写入的 token 都会丢失。现在每次运行都会读取全部 Cursor 对话和 Goose 会话，Hermes 会话在结束前每次都会读取，尚未完成（或无法读取）的 OpenCode 和 Kilo 消息会按 id 保留并重复读取，直到完成。重新读取后未变化的行保持原样并维持已同步状态；`Parsed N records` 只统计新增或有变化的记录。Goose 会话即使之后创建时间变得可读或发生变化，也只保留一条记录。
+- **Trae 会话会因快照文件夹的顺序而被跳过**（[#146](https://github.com/juliantanx/aiusage/pull/146)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 导入在按名称顺序遍历快照文件夹时不断抬高跳过阈值，因此开始时间早于先前已遍历会话的会话永远不会被导入，首次运行也是如此。现在每次运行都会按开始时间顺序读取全部会话，会话的开始时间变化后也只保留一条记录。
+- **Kiro 的 token 日志每次变化都会被重复计入**（[#145](https://github.com/juliantanx/aiusage/pull/145)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 每次变化都会重新读取整个 `tokens_generated.jsonl`，并以新的 id 再次保存之前的每一行，时间戳也取自文件的修改时间。现在每一行只保存一次，id 由文件、行的位置和行内容生成；行内记录了时间时使用该时间；被替换的日志会从头重新读取。已保存的重复记录会在升级后清理一次，并从同步目标中撤回。
+- **Cursor 的 agent transcript 每次增长都会新增一条估算**（[#145](https://github.com/juliantanx/aiusage/pull/145)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 每次解析增长后的 agent transcript 都会在已有估算之外再新增一条，`state.vscdb` 已经统计过的对话也会被再估算一次。现在每个 transcript 只有一条估算，随文件增长而替换；对话一旦有来自 `state.vscdb` 的真实 token 数就不再估算。已保存的重复记录会在升级后清理一次，并从同步目标中撤回。
+- **CodeBuddy IDE 对话每新增一轮就会被重复计入**（[#145](https://github.com/juliantanx/aiusage/pull/145)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 每一轮都会再保存一条对话累计记录，之前的轮次因此被重复统计。现在每个对话只有一条记录，由最新的快照替换。已保存的多余记录会在升级后清理一次，保留的记录会作为最新版本发布到同步目标。
+
+---
+
+## [1.5.24] - 2026-10-21
+
+本版本改进用量数据正确性、价格重算性能和 CLI 日期筛选，包含 [@aaroncchung](https://github.com/aaroncchung) 贡献的 [#142](https://github.com/juliantanx/aiusage/pull/142)、[#143](https://github.com/juliantanx/aiusage/pull/143) 和 [#144](https://github.com/juliantanx/aiusage/pull/144)。
+
+### 修复
+- **`aiusage summary` 和 `aiusage export` 忽略日期选项**（[#144](https://github.com/juliantanx/aiusage/pull/144)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — `summary` 的 `--week`、`--month`、`--from`、`--to`，以及 `export` 的 `--range`、`--from`、`--to` 虽然可以传入，但一直被忽略，两个命令总是统计全部时间；菜单中的“本周”“本月”摘要显示的也是全部时间的总计。现在这些选项按与看板日期范围相同的本地日历日筛选：`--from` 和 `--to` 都包含当天，并且可以单独使用；`--week`、`--month` 和 `--range day|week|month` 的起点与看板对应的预设范围相同，一周的第一天沿用看板中的设置。日期无效、`--from` 晚于 `--to`，或选项相互冲突时，命令会给出提示并退出。导出的行顺序保持不变；不带日期选项时，两个命令的输出与之前完全相同。
+- **`aiusage recalc` 为每条记录重新读取整张价格表**（[#143](https://github.com/juliantanx/aiusage/pull/143)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 对于既没有用户价格、也没有精确别名的模型，该命令会为每条记录重新加载全部有效价格（LiteLLM 同步后约 3,000 行），因此当数据库中有几千条这样的记录时，一次重算需要 10 到 30 秒。现在 `aiusage recalc` 与看板的“立即重算”执行同一个重算函数：每次运行中每个模型只定价一次，价格表最多读取一次；在一个有 45,000 条记录的数据库上，该命令约半秒即可完成。该命令现在也会把没有模型的 Qoder 记录按 `qoder-auto` 定价，与“立即重算”和 Qoder 导入器此前的做法一致。结果的其他方面不变：日志费用、用户价格、对 `synced_records` 的重新定价，以及从其他设备拉取的行的 `updated_at`，处理方式都与之前相同。
+- **v1.5.23 在获得设备 ID 之前就解析过日志的安装上重复统计用量**（[#142](https://github.com/juliantanx/aiusage/pull/142)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 记录 ID 包含设备 ID。v1.5.22 之前，未设置同步的安装以设备 ID `unknown` 解析日志；v1.5.22 为每个安装生成了真实的设备 ID，但保留了旧的记录 ID。v1.5.23 一次性重新导入 Claude Code 和 CodeFuse 日志时，又以新 ID 把此前解析过的每条消息存了第二份。再次导入的 Kelivo 备份、Kelivo 自身的数据库、不断增长的 Roo Code、Kilo Code 和 Kiro 会话文件、更新过的 Zed 对话以及丢失的 watermark 也会这样。用量和费用因此翻倍，副本会在下一次同步时上传。现在每个导入器都会找到某一条数据已有的记录。每个副本会并入原记录：原记录保留其 ID 和同步状态，并采用副本较新的读取结果及其 Claude Code 工具调用。已上传到同步目标的副本会从目标中撤回。升级后会再读取一次 Claude Code、CodeFuse 和 Antigravity 日志以找出副本。对于按行记录的日志，以及此后转录文件已被删除的 Claude Code 消息，迁移会在不读取日志的情况下移除其副本。其他来源已无法读取的副本会保留，直到再次导入该来源；Kelivo 用户请再导入一次最新的备份。
+
+---
+
+## [1.5.23] - 2026-10-20
+
+本版本集中修复 CLI、看板与站点中的同步、导入、定价、审核和 token 统计问题，包含 [@aaroncchung](https://github.com/aaroncchung) 贡献的 [#135](https://github.com/juliantanx/aiusage/pull/135)、[#137](https://github.com/juliantanx/aiusage/pull/137)、[#138](https://github.com/juliantanx/aiusage/pull/138)，以及 [@Fiveo9](https://github.com/Fiveo9) 贡献的 [#136](https://github.com/juliantanx/aiusage/pull/136)、[#139](https://github.com/juliantanx/aiusage/pull/139)。
+
+### 修复
+- **在开启同步的安装上，重新计算出的费用从未反映到看板** — 看板读取本设备的用量时查 `records`，读取其他设备的用量时查 `synced_records`，但“立即重算”和 `aiusage recalc` 只更新了 `records`。当另一台设备上报的记录没有价格时——例如自定义网关上报 `$0`，或解析时该模型还没有价格——无论重算多少次，总费用、每日费用曲线和按模型的费用明细都停留在 `$0`，而底层记录其实早已是正确的金额。现在两张表会在同一个事务里写入相同的值。所属设备已发布的价格不会被改差：本地价格表找不到该模型时保留正数费用（各设备价格表本来就可以不同，“本地不知道”不是修正），所属设备上报的正数日志费用同样保留。所属设备以 `$0` 发布的记录仍会被计价，这正是本次修复的场景。已经带有该价格的记录，以及重算无法为之发声的镜像行（被重算的副本 token 数与镜像不一致，或该镜像根本没有合并副本）都不会被写入。所属设备仍保持权威：重算依然不会把来自其他设备的记录标记为已变更，因此该设备下次发布的修正仍会照常覆盖重算出的价格。在拿不到设备标识时，网页端重算现在也与命令行一致地重算所有记录，而不是跳过从其他设备合并来的记录；进度总数改为统计实际读取的行。
+- **Codex 的推理 token 被重复统计和计费**（[#138](https://github.com/juliantanx/aiusage/pull/138)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — Codex 上报的输出 token 已包含推理 token；它们既被存为输出 token，又被存为思考 token，费用也按两者计算。现在 Codex 以及嵌入 CodeFuse 的 Codex 会话保存的输出 token 不再包含推理部分。已有的本地 Codex 记录由迁移更正并重新计费，CodeFuse 日志会重新导入一次。更正后的记录会在下一次同步时再次上传。首页的 token 构成条现在把思考 token 计入输出部分。
+- **重新导入记录会删除它的工具调用和同步状态**（[#137](https://github.com/juliantanx/aiusage/pull/137)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 记录以 `INSERT OR REPLACE` 写入，该语句会先删除原行，并连带删除其工具调用和各同步目标的同步状态。因此包含多个工具调用的 Claude Code 消息只保存了一个，被重新解析的记录会再次上传到每个目标。现在记录改为原地更新，保留工具调用、`ingested_at` 和同步状态；只有已保存的字段发生变化时才会再次上传。Claude Code 的工具调用改为按 `tool_use` 块的 id 标识。升级后会重新导入一次 Claude Code 日志以恢复缺失的调用；日志已不存在的记录，其工具调用予以保留。
+- **SQLite 版本的 Kelivo 备份无法导入** — Kelivo 将聊天存储从 Hive 迁移到 SQLite 后，`.zip` 备份内变成 `database/kelivo.db` 而不是 `chats.json`，导入会直接以 `chats.json not found in zip` 失败。现在导入器会读取压缩包中的 SQLite 数据库，也接受直接选择的 `.db`/`.sqlite` 文件，`chats.json` 仍然兼容。SQLite 中的微秒时间戳会被正确换算，数据库 `extras_json` 或 `chats.json` 里的 cache-write 与 reasoning token 不再被丢弃。与 AIUsage 其他来源保持一致，cache-write 与 reasoning token 现在单独记入对应字段，不再并入输入与输出 token。
+- **Kelivo 记录沿用应用内的供应商名称** — `providerId` 是面向用户的供应商名称（如 “OpenAI - MiMo”），部分行甚至是 UUID，导致按供应商聚合时显示的是代理配置名而不是模型厂商。现在记录优先使用 AIUsage 依据模型推断出的供应商，仅在模型无法识别时保留 Kelivo 的名称。
+- **Kelivo 数据库在文件大小不再增长后不会被重新读取** — 解析器的 watermark 会跳过「已记录的偏移量到达文件末尾」的文件，这对只追加的日志是对的，对 SQLite 却是错的：SQLite 会原地重写已有页、把新内容写进 `-wal` 而不改变主文件大小，因此首次导入之后的新消息一直看不到。现在每次运行都会完整读取 Kelivo 数据库，并且只在记录的取值确实变化时才写入，所以重复读取既不会产生重复，也不会把已同步的行重新标记为新数据。
+- **复制运行中的 Kelivo 数据库时会把库文件和 WAL 拆开** — 原来逐个复制文件，复制过程中若发生 checkpoint，快照就会悄悄缺少最近的行。现在只要数据库还有 sidecar，就用 SQLite 的在线备份（online backup）生成快照，它包含尚未 checkpoint 的 WAL 内容，也不会出现两者混拼。逐文件复制只保留给 SQLite 无法在线读取的库，同样会给出同类提示。若数据库是被单独复制的（例如从运行中的 Kelivo 上传，缺少 `-wal`），导入仍会执行，但会明确提示最近的消息可能缺失，而不是默默完成。
+- **通过一个快照会公开管理员通过另一个快照隐藏的数据** — 通过快照时，只要某行数据最后一次上传是“已接受”状态就会被公开，即使管理员之后隐藏或拒绝了那次上传，因此通过一个较早的被标记快照会撤销对较新已接受快照的隐藏。现在，只要同一周期内还有被隐藏或被拒绝的快照，通过操作就不会公开任何数据（通过该快照本身仍可恢复该周期）；被单独隐藏的行也不受影响，只有恢复该行才会重新公开（站点迁移 v17 新增 `leaderboard_metrics.entry_hidden`，并根据审计日志回填）。上传为已隐藏周期新增的行默认隐藏，上传历史清理也会保留含有被隐藏或被拒绝快照的上传（无论多久之前，“保留上传历史”设置中已注明），使审核决定不会被清理掉。
+- **关闭 AIUsage Cloud 后其他站点实例最长一分钟内仍允许同步** — 站点设置在每个实例中缓存 60 秒，多实例部署时 `cloud.sync_globally_enabled = 0` 要等其他实例的缓存过期才生效，读取设置失败时还会回退为“开启”。现在每次云同步请求都会读取该开关；读取失败时请求直接失败，既不假定云同步开启，也不沿用之前读到的值。
+- **多个进程同时修改 `state.json` 和 `config.json` 会丢失彼此的更改** — `aiusage serve` 与 CLI 命令各自读取文件、修改后整体写回，另一个进程在此期间的更改会丢失：云同步代数、上次排行榜上传时间、同步授权或已保存的凭据可能退回旧值。现在对这两个文件的修改都在进程间共享的锁（`~/.aiusage/settings.lock`，进程异常退出时由操作系统释放）下进行，适用于 Windows、macOS 和 Linux。从仪表盘保存的 GitHub 令牌会在获取锁之前写入系统钥匙串，钥匙串弹出的授权提示不会阻塞其他进程；如果保存后的设置没有用到该令牌，会再将其删除。
+- **云同步把云端并未保存的记录标记为已同步** — 推送接口会跳过缺少工具或模型的记录却仍返回“已接受”，客户端随后确认整批记录。数据库无法保存的记录（含 NUL 字符、小数或超出范围的数值）会导致整批失败，并且每次同步都会失败，其后的记录再也无法上传。现在服务器在写入前逐条检查记录，保存批次中的其余记录并报告未保存的记录；客户端只确认已保存的记录，不发送云端无法保存的记录，`aiusage sync` 会显示未上传的数量。这些记录作为未同步数据保留在本机。用于撤回过时线上 ID 的删除标记（迁移 v14）也按同样方式处理：服务器逐条报告未应用的删除标记，客户端只清除已应用的 ID，其余的在下次同步时再次撤回。
+- **站点价格同步让转售商的 LiteLLM 条目覆盖模型自身价格** — #133 的修复只覆盖了 CLI，站点同步仍为每个模型键保留文件中的最后一个条目（`claude-haiku-4-5` 使用 aihubmix 的价格，比 Anthropic 高 10%）。现在站点使用与 CLI 相同的定价规划逻辑（已移至 `@aiusage/core`）。价格会在下一次管理员价格同步时更正；已上传的排行榜费用在重新计算排行榜后更新。
+- **排行榜重新计算使费用低于其 Token 的实际费用** — 重新计算在汇总父级行时排除了被隐藏的行，并可能用尚未重新计算的行汇总 `all` 行，因此单独隐藏某一行后，公开的总计费用会低于其 Token 的费用。现在每一行都按上传时的方式计价，与可见性无关。
+- **排行榜筛选列表包含被封禁和设为私密用户的工具与模型** — 现在只列出排行榜实际显示的内容。排行榜首页缓存按站点实例保存，现在无论设置的 TTL 多大，条目最多保留五分钟，从而限制其他实例显示刚被隐藏数据的时长。
+- **仪表盘对已保存的设置报告“Invalid JSON body”** — `PUT /api/config` 对所有错误都这样回应，包括写入 `config.json` 之后发生的错误。现在每种失败都有各自的响应，已保存的设置会被应用。
+- **`aiusage clean` 将失败的远程清理报告为已跳过并以 0 退出** — 现在报告为失败，命令以 1 退出。
+- **菜单操作在 Windows 上没有任何效果** — 菜单在没有 shell 的情况下启动 `aiusage`，无法运行 npm 的 `aiusage.cmd` 包装脚本。现在直接通过 Node.js 运行 CLI。
+- **旧版本保存的刷新或同步间隔可能连续不停地运行** — `aiusage serve` 现在对所有已保存的值应用 1 秒和 1 分钟的最小值。
+
+### 变更
+- **贡献者链接** — Aaron C 更改 GitHub 用户名后，中英文 README 中的个人主页和提交记录链接已同步更新。
+
+---
+
+## [1.5.22] - 2026-10-14
+
+强化本地状态与定时上传的可靠性，让 LiteLLM 定价结果保持确定，并减少站点数据库查询。
+
+### 修复
+- **排行榜按月自动上传会连续不停地上传**（[#131](https://github.com/juliantanx/aiusage/pull/131)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — “每月”间隔（2592000000 毫秒）超过了 Node 定时器能保存的最大延迟，定时器因此每毫秒触发一次，`aiusage serve` 会连续不断地解析并上传。现在自动上传从上一次成功上传的时间起等待一个间隔，该时间保存在 `state.json` 中，保存配置或重启不再重新计时。手动上传也计入该计划，失败或被拒绝的上传会在一小时后重试。已开启自动上传的安装在升级后首次启动 `serve` 时会上传一次。
+- **间隔设置可以保存任意数值**（[#131](https://github.com/juliantanx/aiusage/pull/131)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — `refreshInterval` 小于 1 秒、`syncInterval` 小于 1 分钟、`leaderboardUploadInterval` 不在 1 小时到 365 天之间，或刷新、同步间隔超过定时器上限（2^31 − 1 毫秒）时，`PUT /api/config` 现在返回 400 `INVALID_INTERVAL`。留空或填 0 仍会移除该设置。
+- **无法读取的 `state.json` 或 `config.json` 会被覆盖**（[#132](https://github.com/juliantanx/aiusage/pull/132)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 文件存在但无法解析时被当作不存在，下一次保存会用默认内容覆盖它：被截断的 `state.json` 会让安装获得新的设备标识并丢失同步授权，带有笔误的 `config.json` 会丢失设置。现在两个文件都通过临时文件加重命名的方式写入，无法读取的文件不会再被覆盖。命令会输出指明该文件的错误信息，保持文件不变，并以非零状态退出。
+- **后台同步失败会终止 `aiusage serve`**（[#132](https://github.com/juliantanx/aiusage/pull/132)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 后台同步中抛出的错误成为未处理的 Promise 拒绝并使进程退出；在没有 `state.json` 的安装上进行云同步就是触发方式之一。现在该错误会被捕获并显示在同步状态中，每个命令运行前都会创建 `state.json`，同步遇到缺失或无法读取的状态文件时会报告为一次失败的运行。
+- **LiteLLM 价格同步会让转售商的条目覆盖模型自身的价格**（[#133](https://github.com/juliantanx/aiusage/pull/133)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 同步时会去掉 id 的提供商前缀，因此 `aihubmix/claude-haiku-4-5`、`vertex_ai/claude-haiku-4-5` 和 `claude-haiku-4-5` 共用同一个价格键，文件中最后出现的条目生效。现在每个键只有一个来源：优先使用与键同名的条目，其次是模型开发商自己的条目，再按固定的提供商顺序选择（`aihubmix` 排在最后）；价格为零的条目不会覆盖有价格的条目。结果不再取决于文件中的顺序。已保存的价格会在下一次价格同步时更正。
+- **站点对每个未保存的配置项都查询数据库，并且每个请求加载两次会话**（[#134](https://github.com/juliantanx/aiusage/pull/134)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — `readConfig` 只在 `site_config` 中存在对应行时才缓存，因此在管理员保存表单之前每次读取都是一次查询，而一次上传会为每个快照读取十一项风控设置（五个快照共 57 次配置查询）。现在不存在的配置项与已保存的值一样缓存 60 秒，风控设置每次上传只读取一次，`requireUser` 和 `requireAdmin` 使用请求钩子已加载的用户。
+
+---
+
+## [1.5.21] - 2026-10-12
+
+保护 CLI 的破坏性操作，使云同步确认与同步代保持一致，修正会话分析，并保留排行榜数据与审核状态。
+
+### 修复
+- **清理上传历史时排行榜数据被一并删除**（[#127](https://github.com/juliantanx/aiusage/pull/127)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — `leaderboard_metrics` 以 `ON DELETE CASCADE` 引用上传请求，因此清理任务删除早于“保留上传历史”设置（默认 180 天）的上传请求时，这些请求写入的排行榜数据也被删除。站点迁移 v16 将该列改为可空，并将外键改为 `ON DELETE SET NULL`；迁移在首次启动时自动执行，此后清理不再影响排行榜。
+- **排行榜审核结果被下一次上传覆盖**（[#127](https://github.com/juliantanx/aiusage/pull/127)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 管理员隐藏某个周期后，用户再次上传该周期会让数据重新公开；对已被后续上传取代的快照执行通过、拒绝或隐藏时，实际没有任何变更却返回成功。现在隐藏的数据在再次上传后保持隐藏；快照操作按用户和周期匹配，返回变更的行数，并在快照不存在时报错。通过快照时只公开由该次上传或同一周期内已接受、已通过的上传写入的数据，同一用户的上传与审核操作串行执行。
+- **云端未收到的记录被标记为已同步**（[#129](https://github.com/juliantanx/aiusage/pull/129)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 上传完成后，云同步会重新读取待上传记录并全部标记，因此上传期间新解析的记录未被发送就被标记，上传期间被改写的记录也被视为已同步，而它的新版本并未发送。现在每个批次在云端接受后立即确认，且只有仍是已发送版本的记录才会被标记。
+- **云端被清空后不再上传任何数据**（[#129](https://github.com/juliantanx/aiusage/pull/129)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 清空云端会开启新的同步代，但已同步过的设备保留了原有同步状态，不会向新一代上传任何内容。现在按同步目标保存同步代，拉取到不同的同步代时设备会重新上传记录。云端在本版本之前已被清空的设备会在首次同步时重新上传一次历史记录；云端已有的记录保持不变。每个安装同一时间只运行一个云同步。
+- **会话列表的 token 和费用被放大**（[#130](https://github.com/juliantanx/aiusage/pull/130)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 列表在求和之前先将记录与工具调用关联，因此每条记录的 token 和费用按工具调用次数被重复计算。现在先按会话汇总记录，再附加工具调用次数。
+- **多模型会话的头部只统计了部分数据**（[#130](https://github.com/juliantanx/aiusage/pull/130)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 头部除会话外还按工具和模型分组。现在头部覆盖整个会话，`GET /api/sessions/:id` 以 `session.models` 返回使用过的模型。
+- **会话分页**（[#130](https://github.com/juliantanx/aiusage/pull/130)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 日期范围或设备变化时，会话页面回到第一页，并忽略先前筛选条件的迟到响应。`page` 或 `pageSize` 不是正整数时，`GET /api/sessions` 返回 400 `INVALID_PARAM`，此前会被修正为默认范围或返回 500。
+- **`clean --before` 清空了整个云端数据**（[#128](https://github.com/juliantanx/aiusage/pull/128)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 云端后端不支持部分删除，而只清理较早记录的操作仍会调用云端的清空接口，删除全部数据并开启新的同步代。现在只有 `clean --all` 会清空云端；`--before` 只清理本地，并提示云端数据保持不变。
+- **菜单中的清理对任意输入都会执行**（[#128](https://github.com/juliantanx/aiusage/pull/128)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — 在菜单的 数据 → 清理 中，输入空行或 `2`、`3` 以外的任何内容都会删除 180 天前的记录，并附带 `--yes` 跳过确认。现在只有明确输入 `1` 才执行，其余输入一律取消，确认交由命令本身处理。
+- **`aiusage init` 丢失已有设置**（[#128](https://github.com/juliantanx/aiusage/pull/128)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — `init` 只用少数字段重建配置，其余键全部丢失；未指定 `--backend` 时还会移除同步配置，而菜单的 Init 入口正是这样调用的。现在所有分支都保留已有配置，只修改传入的项；只有显式指定 `--backend skip` 才会移除同步。
+
+---
+
+## [1.5.20] - 2026-10-10
+
+修正缓存输入 token 统计，并恢复新版 Git for Windows 上的 GitHub 同步。
+
+### 修复
+- **Codex 缓存输入 token 被重复统计和计费**（[#73](https://github.com/juliantanx/aiusage/pull/73)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — Codex 日志中的 `input_tokens` 已包含 `cached_input_tokens`，而解析器将两者原样存储。其他工具的输入只存储未缓存部分，计价时输入与缓存读取分别计费，因此 Codex 的缓存 token 同时出现在输入列和缓存读取列中，既按输入价格又按缓存读取价格各计费一次，导致 Codex 的输入 token、总 token 和费用偏高。解析器现在将 `input_tokens - cached_input_tokens` 作为输入存储。数据库迁移 v15 会对本设备已解析的 Codex 记录做同样的修正，并将这些记录标记为已变更，以便下次同步时发布修正后的值；来自计价的费用会在迁移之后、精选价格写入且运行时价格表（注册表、别名和旧版 `config.priceOverrides`）加载完成后立即重新计算，因此与解析器的计算结果一致。日志中记录的费用保持不变。从其他设备拉取的 Codex 记录会在该设备升级并同步后得到修正。
+- **CodeFuse 内嵌 Codex 会话的缓存输入 token 被重复统计和计费**（[#74](https://github.com/juliantanx/aiusage/pull/74)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — CodeFuse 通过内嵌 Codex 引擎运行的会话，其日志中的 `input_tokens` 已包含 `cached_input_tokens`，而解析器将两者原样存储，因此缓存 token 同时出现在输入列和缓存读取列中，既按输入价格又按缓存读取价格各计费一次。解析器现在对这类会话将 `input_tokens - cached_input_tokens` 作为输入存储；CodeFuse 的 Claude Code 格式和原生格式原本就是正确的。CodeFuse 解析在 `watermark.json` 中带有版本号：升级后会重新导入每个 CodeFuse 日志一次；由于记录 ID 不依赖 token 数，修正后的输入 token 和费用会原地替换旧行，并在下次同步时发布。日志文件已不存在的记录无法重新导入，仍保留旧值。
+- **本地重新计算价格后忽略其他设备的修正**（[#73](https://github.com/juliantanx/aiusage/pull/73)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — “重新计算价格”会把它重新计价的每条记录都标上本地时间，包括从其他设备拉取的记录副本。这样的副本看起来比其所属设备之后发布的任何版本都新，因此后续修正虽然进入了 `synced_records`，却不会更新汇总和导出所读取的合并副本。现在重新计算只把本地解析的记录标记为已变更；合并副本的 token 数与所属设备当前记录不一致时，无论时间戳如何都会刷新，这也能修复此前已被重新计算标记过的副本。
+- **Git for Windows 2.56 上 GitHub 同步失败**（[#72](https://github.com/juliantanx/aiusage/pull/72)，由 [@aaroncchung](https://github.com/aaroncchung) 贡献） — Git for Windows 2.56 会拒绝 `GIT_CONFIG_GLOBAL=NUL`，导致隔离环境中的每个 Git 命令都在同步前失败。Windows 现在改用 AIUsage 自有的空白普通文件作为全局 Git 配置，同时继续禁用系统配置、继承的 Git 设置、凭据持久化和 hooks。Git 操作失败时现在会显示经过脱敏的可执行摘要，不复制服务端可控内容，也不会泄露凭据。
+
+---
+
 ## [1.5.19] - 2026-09-24
 
 ### 修复
@@ -519,6 +652,15 @@
 
 ---
 
+[1.5.28]: https://github.com/juliantanx/aiusage/compare/v1.5.27...v1.5.28
+[1.5.27]: https://github.com/juliantanx/aiusage/compare/v1.5.26...v1.5.27
+[1.5.26]: https://github.com/juliantanx/aiusage/compare/v1.5.25...v1.5.26
+[1.5.25]: https://github.com/juliantanx/aiusage/compare/v1.5.24...v1.5.25
+[1.5.24]: https://github.com/juliantanx/aiusage/compare/v1.5.23...v1.5.24
+[1.5.23]: https://github.com/juliantanx/aiusage/compare/v1.5.22...v1.5.23
+[1.5.22]: https://github.com/juliantanx/aiusage/compare/v1.5.21...v1.5.22
+[1.5.21]: https://github.com/juliantanx/aiusage/compare/v1.5.20...v1.5.21
+[1.5.20]: https://github.com/juliantanx/aiusage/compare/v1.5.19...v1.5.20
 [1.5.19]: https://github.com/juliantanx/aiusage/compare/v1.5.18...v1.5.19
 [1.5.18]: https://github.com/juliantanx/aiusage/compare/v1.5.17...v1.5.18
 [1.5.17]: https://github.com/juliantanx/aiusage/compare/v1.5.16...v1.5.17

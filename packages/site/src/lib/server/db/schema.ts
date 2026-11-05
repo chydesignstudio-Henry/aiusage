@@ -1,3 +1,4 @@
+import type postgres from 'postgres'
 import { sql } from './pool.js'
 import { ensureCuratedPricingAliases } from '../pricing/curated-aliases.js'
 import { ensureCuratedPrices } from '../pricing/curated-prices.js'
@@ -8,7 +9,7 @@ export async function runMigrations(): Promise<void> {
     applied_at TIMESTAMPTZ DEFAULT NOW()
   )`
 
-  const applied = await sql`SELECT version FROM schema_migrations ORDER BY version`
+  const applied = await sql<{ version: number }[]>`SELECT version FROM schema_migrations ORDER BY version`
   const appliedVersions = new Set(applied.map((r: { version: number }) => r.version))
 
   for (const migration of migrations) {
@@ -34,7 +35,7 @@ const migrations = [
   {
     version: 1,
     name: 'initial_schema',
-    up: async (tx: ReturnType<typeof sql>) => {
+    up: async (tx: postgres.TransactionSql) => {
       await tx`DO $$ BEGIN CREATE TYPE user_role AS ENUM ('user', 'admin'); EXCEPTION WHEN duplicate_object THEN NULL; END $$`
       await tx`DO $$ BEGIN CREATE TYPE user_status AS ENUM ('active', 'banned', 'deleted'); EXCEPTION WHEN duplicate_object THEN NULL; END $$`
       await tx`DO $$ BEGIN CREATE TYPE period_type AS ENUM ('daily', 'weekly', 'monthly', 'yearly', 'all_time'); EXCEPTION WHEN duplicate_object THEN NULL; END $$`
@@ -180,7 +181,7 @@ const migrations = [
   {
     version: 2,
     name: 'username_change_tracking',
-    up: async (tx: ReturnType<typeof sql>) => {
+    up: async (tx: postgres.TransactionSql) => {
       await tx`ALTER TABLE users ADD COLUMN IF NOT EXISTS username_changed_at TIMESTAMPTZ`
 
       await tx`CREATE TABLE IF NOT EXISTS reserved_usernames (
@@ -196,7 +197,7 @@ const migrations = [
   {
     version: 3,
     name: 'leaderboard_metrics',
-    up: async (tx: ReturnType<typeof sql>) => {
+    up: async (tx: postgres.TransactionSql) => {
       await tx`DROP TABLE IF EXISTS leaderboard_entries`
       await tx`DELETE FROM upload_snapshots`
       await tx`DELETE FROM upload_requests`
@@ -241,7 +242,7 @@ const migrations = [
   {
     version: 4,
     name: 'unknown_cost_and_anonymous',
-    up: async (tx: ReturnType<typeof sql>) => {
+    up: async (tx: postgres.TransactionSql) => {
       // Add has_unknown_cost flag: true when model is not in official price table
       await tx`ALTER TABLE leaderboard_metrics ADD COLUMN IF NOT EXISTS has_unknown_cost BOOLEAN DEFAULT FALSE`
 
@@ -252,7 +253,7 @@ const migrations = [
   {
     version: 5,
     name: 'cloud_sync',
-    up: async (tx: ReturnType<typeof sql>) => {
+    up: async (tx: postgres.TransactionSql) => {
       // cloud_device_instances: binds a CLI device to a local deviceInstanceId for cloud sync
       await tx`CREATE TABLE IF NOT EXISTS cloud_device_instances (
         id TEXT PRIMARY KEY,
@@ -353,7 +354,7 @@ const migrations = [
   {
     version: 6,
     name: 'user_settings_tables',
-    up: async (tx: ReturnType<typeof sql>) => {
+    up: async (tx: postgres.TransactionSql) => {
       // user_sync_settings: per-user sync preferences (§9.1)
       await tx`CREATE TABLE IF NOT EXISTS user_sync_settings (
         user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -379,7 +380,7 @@ const migrations = [
   {
     version: 7,
     name: 'email_verification_tokens',
-    up: async (tx: ReturnType<typeof sql>) => {
+    up: async (tx: postgres.TransactionSql) => {
       await tx`CREATE TABLE IF NOT EXISTS email_verification_tokens (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -400,7 +401,7 @@ const migrations = [
   {
     version: 8,
     name: 'email_send_attempts',
-    up: async (tx: ReturnType<typeof sql>) => {
+    up: async (tx: postgres.TransactionSql) => {
       await tx`CREATE TABLE IF NOT EXISTS email_send_attempts (
         id TEXT PRIMARY KEY,
         purpose TEXT NOT NULL,
@@ -417,7 +418,7 @@ const migrations = [
   {
     version: 9,
     name: 'site_config',
-    up: async (tx: ReturnType<typeof sql>) => {
+    up: async (tx: postgres.TransactionSql) => {
       await tx`CREATE TABLE IF NOT EXISTS site_config (
         key TEXT PRIMARY KEY,
         value JSONB NOT NULL,
@@ -430,7 +431,7 @@ const migrations = [
   {
     version: 11,
     name: 'password_reset_tokens',
-    up: async (tx: ReturnType<typeof sql>) => {
+    up: async (tx: postgres.TransactionSql) => {
       await tx`CREATE TABLE IF NOT EXISTS password_reset_tokens (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -447,7 +448,7 @@ const migrations = [
   {
     version: 12,
     name: 'cloud_sync_star_gating',
-    up: async (tx: ReturnType<typeof sql>) => {
+    up: async (tx: postgres.TransactionSql) => {
       // Store GitHub OAuth access token for star verification
       await tx`ALTER TABLE user_identities ADD COLUMN IF NOT EXISTS access_token TEXT`
 
@@ -462,7 +463,7 @@ const migrations = [
   {
     version: 13,
     name: 'reverse_cloud_sync_enabled_semantics',
-    up: async (tx: ReturnType<typeof sql>) => {
+    up: async (tx: postgres.TransactionSql) => {
       // cloud_sync_enabled semantics reversed: true now means "banned from cloud"
       // Reset all existing true values to false (previously meant "admin override allow")
       await tx`UPDATE users SET cloud_sync_enabled = FALSE WHERE cloud_sync_enabled = TRUE`
@@ -471,7 +472,7 @@ const migrations = [
   {
     version: 14,
     name: 'current_model_price_registry',
-    up: async (tx: ReturnType<typeof sql>) => {
+    up: async (tx: postgres.TransactionSql) => {
       await tx`CREATE TABLE IF NOT EXISTS model_prices (
         model_key TEXT PRIMARY KEY,
         provider TEXT NOT NULL DEFAULT '',
@@ -511,11 +512,74 @@ const migrations = [
   {
     version: 15,
     name: 'remove_versioned_price_tables',
-    up: async (tx: ReturnType<typeof sql>) => {
+    up: async (tx: postgres.TransactionSql) => {
       await tx`ALTER TABLE leaderboard_metrics DROP COLUMN IF EXISTS pricing_version`
       await tx`DROP TABLE IF EXISTS official_price_entries`
       await tx`DROP TABLE IF EXISTS official_price_tables`
       await tx`DROP TYPE IF EXISTS price_table_status`
+    }
+  },
+  {
+    version: 16,
+    name: 'keep_leaderboard_metrics_when_upload_history_is_pruned',
+    up: async (tx: postgres.TransactionSql) => {
+      // The daily cleanup deletes upload_requests older than
+      // retention.upload_request_days. leaderboard_metrics referenced them
+      // with ON DELETE CASCADE, so the leaderboard rows went with them. They
+      // now outlive the upload history: the reference is cleared instead.
+      // Every statement can run again on a table that already has the new shape.
+      await tx`ALTER TABLE leaderboard_metrics ALTER COLUMN upload_request_id DROP NOT NULL`
+
+      // Drop the old constraint by what it is, not by its generated name.
+      await tx`DO $$
+        DECLARE fk RECORD;
+        BEGIN
+          FOR fk IN
+            SELECT c.conname
+            FROM pg_constraint c
+            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+            WHERE c.conrelid = 'leaderboard_metrics'::regclass
+              AND c.confrelid = 'upload_requests'::regclass
+              AND c.contype = 'f'
+              AND a.attname = 'upload_request_id'
+          LOOP
+            EXECUTE format('ALTER TABLE leaderboard_metrics DROP CONSTRAINT %I', fk.conname);
+          END LOOP;
+        END $$`
+
+      await tx`ALTER TABLE leaderboard_metrics
+        ADD CONSTRAINT leaderboard_metrics_upload_request_id_fkey
+        FOREIGN KEY (upload_request_id) REFERENCES upload_requests(id) ON DELETE SET NULL`
+    }
+  },
+  {
+    version: 17,
+    name: 'leaderboard_metrics_entry_hidden',
+    up: async (tx: postgres.TransactionSql) => {
+      // Marks a row an admin hid on its own (hideLeaderboardEntry), so that an
+      // approval of a snapshot of its period does not publish it again.
+      await tx`ALTER TABLE leaderboard_metrics ADD COLUMN IF NOT EXISTS entry_hidden BOOLEAN NOT NULL DEFAULT FALSE`
+
+      // Rows hidden on their own before the column existed, from the audit
+      // log's last hide or restore of each row. A row whose log entries were
+      // cleared is treated like a row hidden with its period.
+      // admin_audit_logs has no index on its target, so the last action of
+      // every row is found in one pass over the log rather than one lookup
+      // per hidden row.
+      await tx`
+        UPDATE leaderboard_metrics lm
+        SET entry_hidden = TRUE
+        FROM (
+          SELECT DISTINCT ON (al.target_id) al.target_id, al.action
+          FROM admin_audit_logs al
+          WHERE al.target_type = 'leaderboard_metrics'
+            AND al.action IN ('hide_metric', 'restore_metric')
+          ORDER BY al.target_id, al.created_at DESC, al.id DESC
+        ) last_action
+        WHERE last_action.target_id = lm.id
+          AND last_action.action = 'hide_metric'
+          AND lm.visibility = 'hidden'
+      `
     }
   }
 ]

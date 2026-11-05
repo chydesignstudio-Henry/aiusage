@@ -1,6 +1,6 @@
 import type { Parser, ParseResult, ParseContext } from '../types.js'
 import type { StatsRecord, ToolCallRecord, Tool } from '../types.js'
-import { generateRecordId, generateToolCallId, generateOrphanToolCallId } from '../record-id.js'
+import { recordIdFor, generateToolCallId, generateOrphanToolCallId } from '../record-id.js'
 import { inferProvider } from '../provider.js'
 import { calculateCost } from '../pricing.js'
 
@@ -64,10 +64,16 @@ export class CodexParser implements Parser {
     const rawTs = parsed.event_msg?.timestamp ?? parsed.timestamp ?? context.now
     const ts = typeof rawTs === 'number' ? rawTs : new Date(rawTs).getTime()
 
-    const inputTokens = usage.input_tokens ?? 0
-    const outputTokens = usage.output_tokens ?? 0
+    // Codex reports input_tokens inclusive of cached_input_tokens. Store only the
+    // uncached part so cached tokens are not counted (and priced) twice.
     const cacheReadTokens = usage.cached_input_tokens ?? 0
+    const inputTokens = Math.max(0, (usage.input_tokens ?? 0) - cacheReadTokens)
+    // Codex also reports output_tokens inclusive of reasoning_output_tokens
+    // (total_tokens = input_tokens + output_tokens). Totals sum the output and
+    // thinking columns and pricing charges both at the output price, so store
+    // only the non-reasoning part as output.
     const thinkingTokens = usage.reasoning_output_tokens ?? 0
+    const outputTokens = Math.max(0, (usage.output_tokens ?? 0) - thinkingTokens)
     const cacheWriteTokens = 0 // Codex doesn't provide this
 
     const cost = model === 'unknown' ? 0 : calculateCost(model, {
@@ -81,7 +87,7 @@ export class CodexParser implements Parser {
     const costSource = model === 'unknown' ? 'unknown' as const : 'pricing' as const
     const provider = inferProvider(model)
 
-    const recordId = generateRecordId(context.deviceInstanceId, context.sourceFile, context.lineOffset)
+    const recordId = recordIdFor(context, context.sourceFile, context.lineOffset)
 
     const record: StatsRecord = {
       id: recordId,

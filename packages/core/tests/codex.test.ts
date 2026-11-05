@@ -39,7 +39,8 @@ describe('CodexParser', () => {
     expect(result).not.toBeNull()
     expect(result!.record.model).toBe('gpt-4o')
     expect(result!.record.inputTokens).toBe(100)
-    expect(result!.record.outputTokens).toBe(50)
+    // fixture: output_tokens 50 of which reasoning_output_tokens 20
+    expect(result!.record.outputTokens).toBe(30)
     expect(result!.record.cacheReadTokens).toBe(0)
     expect(result!.record.thinkingTokens).toBe(20)
     expect(result!.record.cacheWriteTokens).toBe(0)
@@ -47,6 +48,15 @@ describe('CodexParser', () => {
     expect(result!.toolCalls).toHaveLength(1)
     expect(result!.toolCalls[0].name).toBe('Read')
     expect(result!.toolCalls[0].recordId).toBe(result!.record.id)
+  })
+
+  it('stores input tokens exclusive of cached input tokens', () => {
+    const parser = new CodexParser()
+    // fixture: input_tokens 200 of which cached_input_tokens 50
+    const result = parser.parseLine(lines[4], { ...baseContext, lineOffset: 0 })
+    expect(result!.record.inputTokens).toBe(150)
+    expect(result!.record.cacheReadTokens).toBe(50)
+    expect(result!.record.outputTokens).toBe(80)
   })
 
   it('associates multiple tool calls with one token_count', () => {

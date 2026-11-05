@@ -1,27 +1,44 @@
 import { sql } from '$lib/server/db/pool.js'
 
 interface ConfigEntry {
-  value: number
+  /** null: the key has no row in site_config, so callers use their default. */
+  value: number | null
   updatedAt: number
 }
 
 const CACHE_TTL_MS = 60_000
 const cache = new Map<string, ConfigEntry>()
+// Bumped whenever the cache is written outside readConfig, so that a read
+// which started before a save does not put its older result over the saved one.
+let cacheGeneration = 0
+
+// Switches an admin turns off to stop something at once. The cache is per
+// server instance and setConfig refreshes only the instance that saved, so a
+// cached value would keep the others going for up to CACHE_TTL_MS. These keys
+// are read from site_config on every lookup instead (one primary-key query).
+// When that read fails the lookup throws: it neither assumes the default nor
+// reuses an earlier read, so a database error never keeps a switched-off
+// feature running.
+const UNCACHED_KEYS: ReadonlySet<string> = new Set(['cloud.sync_globally_enabled'])
 
 async function readConfig(key: string): Promise<number | null> {
+  const uncached = UNCACHED_KEYS.has(key)
   const cached = cache.get(key)
-  if (cached && Date.now() - cached.updatedAt < CACHE_TTL_MS) {
+  if (!uncached && cached && Date.now() - cached.updatedAt < CACHE_TTL_MS) {
     return cached.value
   }
 
+  const generation = cacheGeneration
   try {
     const rows = await sql`SELECT value FROM site_config WHERE key = ${key}`
     const row = rows[0] as { value: number } | undefined
-    if (row) {
-      cache.set(key, { value: row.value, updatedAt: Date.now() })
-      return row.value
+    const value = row ? row.value : null
+    if (generation === cacheGeneration) {
+      cache.set(key, { value, updatedAt: Date.now() })
     }
-  } catch {
+    return value
+  } catch (err) {
+    if (uncached) throw err
     // DB unavailable (e.g. tests without DB) — fall back to default
   }
   return null
@@ -35,7 +52,7 @@ export async function getConfig(key: string, defaultValue: number): Promise<numb
 function getConfigSync(key: string, defaultValue: number): number {
   const cached = cache.get(key)
   if (cached && Date.now() - cached.updatedAt < CACHE_TTL_MS) {
-    return cached.value
+    return cached.value ?? defaultValue
   }
   return defaultValue
 }
@@ -46,19 +63,21 @@ export async function setConfig(key: string, value: number, description: string,
     VALUES (${key}, ${value}, ${description}, NOW(), ${userId})
     ON CONFLICT (key) DO UPDATE SET value = ${value}, updated_at = NOW(), updated_by = ${userId}
   `
+  cacheGeneration++
   cache.set(key, { value, updatedAt: Date.now() })
 }
 
 export async function getAllConfigs(): Promise<Record<string, { value: number; description: string | null }>> {
-  const rows = await sql`SELECT key, value, description FROM site_config ORDER BY key`
+  const rows = await sql<{ key: string; value: number; description: string | null }[]>`SELECT key, value, description FROM site_config ORDER BY key`
   const result: Record<string, { value: number; description: string | null }> = {}
-  for (const row of rows as Array<{ key: string; value: number; description: string | null }>) {
+  for (const row of rows) {
     result[row.key] = { value: row.value, description: row.description }
   }
   return result
 }
 
 export function invalidateConfigCache(): void {
+  cacheGeneration++
   cache.clear()
 }
 
@@ -347,7 +366,7 @@ export const CONFIG_DESCRIPTIONS: Record<string, string> = {
   [CFG.NONCE_RETENTION_MINUTES]: 'How often expired upload tokens are cleaned up (minutes)',
 
   [CFG.RETENTION_NONCE_HOURS]:         'Keep upload tokens for this many hours',
-  [CFG.RETENTION_UPLOAD_REQUEST_DAYS]: 'Keep upload history for this many days',
+  [CFG.RETENTION_UPLOAD_REQUEST_DAYS]: 'Keep upload history for this many days (uploads with a hidden or rejected snapshot are kept)',
   [CFG.RETENTION_SYNC_BATCH_DAYS]:     'Keep sync history for this many days',
   [CFG.RETENTION_TOMBSTONE_DAYS]:      'Permanently delete removed records after this many days',
   [CFG.RETENTION_DEVICE_AUTH_HOURS]:   'Clean up expired CLI login codes after this many hours',
@@ -412,7 +431,7 @@ export const CONFIG_DESCRIPTIONS_ZH: Record<string, string> = {
   [CFG.NONCE_RETENTION_MINUTES]: '每隔几分钟清理过期的上传令牌',
 
   [CFG.RETENTION_NONCE_HOURS]:         '上传令牌保留几小时后自动清理',
-  [CFG.RETENTION_UPLOAD_REQUEST_DAYS]: '上传历史记录保留几天',
+  [CFG.RETENTION_UPLOAD_REQUEST_DAYS]: '上传历史记录保留几天（含已隐藏或已拒绝快照的上传不会被清理）',
   [CFG.RETENTION_SYNC_BATCH_DAYS]:     '同步历史记录保留几天',
   [CFG.RETENTION_TOMBSTONE_DAYS]:      '已删除的记录在几天后彻底清除',
   [CFG.RETENTION_DEVICE_AUTH_HOURS]:   '过期的 CLI 登录码在几小时后清理',

@@ -1,3 +1,4 @@
+import type postgres from 'postgres'
 import { sql } from '../db/pool.js'
 import { decryptDeviceSecret, sha256, buildCanonicalString, hashIp, computeHmac } from '../crypto/hmac.js'
 import { invalidateLeaderboardCache } from '../leaderboard/query.js'
@@ -218,7 +219,7 @@ function getBreakdownShapeError(raw: Record<string, unknown>): string | null {
   }
 }
 
-function validateBreakdownShape(raw: Record<string, unknown>): raw is UploadBreakdown {
+function validateBreakdownShape(raw: Record<string, unknown>): raw is Record<string, unknown> & UploadBreakdown {
   return getBreakdownShapeError(raw) === null
 }
 
@@ -471,25 +472,39 @@ interface RiskAssessment {
   reasonMessage?: string
 }
 
+type RiskSettings = Awaited<ReturnType<typeof loadRiskSettings>>
+
+/** Read once per upload, before its transaction, and used for every snapshot. */
+async function loadRiskSettings() {
+  return {
+    inconsistencyPct: await getConfigValue(CFG.RISK_INCONSISTENCY_PCT),
+    unknownModelPct: await getConfigValue(CFG.RISK_UNKNOWN_MODEL_PCT),
+    repeatCount: await getConfigValue(CFG.RISK_REPEAT_COUNT),
+    repeatWindowHours: await getConfigValue(CFG.RISK_REPEAT_WINDOW_HOURS),
+    tokenSpikeMultiplier: await getConfigValue(CFG.RISK_TOKEN_SPIKE_MULTIPLIER),
+    tokenSpikeMinAvg: await getConfigValue(CFG.RISK_TOKEN_SPIKE_MIN_AVG),
+    tokenSpikeLookbackDays: await getConfigValue(CFG.RISK_TOKEN_SPIKE_LOOKBACK_DAYS),
+
+    ruleInconsistency: await getConfigValue(CFG.RISK_RULE_INCONSISTENCY),
+    ruleUnknownModel: await getConfigValue(CFG.RISK_RULE_UNKNOWN_MODEL),
+    ruleRepeat: await getConfigValue(CFG.RISK_RULE_REPEAT),
+    ruleTokenSpike: await getConfigValue(CFG.RISK_RULE_TOKEN_SPIKE),
+  }
+}
+
 async function assessRisk(
-  tx: ReturnType<typeof sql>,
+  tx: postgres.TransactionSql,
   userId: string,
   deviceId: string,
   snapshot: UploadSnapshot,
-  pricing: PricingRegistry
+  pricing: PricingRegistry,
+  settings: RiskSettings
 ): Promise<RiskAssessment> {
-  const inconsistencyPct = await getConfigValue(CFG.RISK_INCONSISTENCY_PCT)
-  const unknownModelPct = await getConfigValue(CFG.RISK_UNKNOWN_MODEL_PCT)
-  const repeatCount = await getConfigValue(CFG.RISK_REPEAT_COUNT)
-  const repeatWindowHours = await getConfigValue(CFG.RISK_REPEAT_WINDOW_HOURS)
-  const tokenSpikeMultiplier = await getConfigValue(CFG.RISK_TOKEN_SPIKE_MULTIPLIER)
-  const tokenSpikeMinAvg = await getConfigValue(CFG.RISK_TOKEN_SPIKE_MIN_AVG)
-  const tokenSpikeLookbackDays = await getConfigValue(CFG.RISK_TOKEN_SPIKE_LOOKBACK_DAYS)
-
-  const ruleInconsistency = await getConfigValue(CFG.RISK_RULE_INCONSISTENCY)
-  const ruleUnknownModel = await getConfigValue(CFG.RISK_RULE_UNKNOWN_MODEL)
-  const ruleRepeat = await getConfigValue(CFG.RISK_RULE_REPEAT)
-  const ruleTokenSpike = await getConfigValue(CFG.RISK_RULE_TOKEN_SPIKE)
+  const {
+    inconsistencyPct, unknownModelPct, repeatCount, repeatWindowHours,
+    tokenSpikeMultiplier, tokenSpikeMinAvg, tokenSpikeLookbackDays,
+    ruleInconsistency, ruleUnknownModel, ruleRepeat, ruleTokenSpike,
+  } = settings
 
   if (ruleInconsistency) {
     // Rule 1: Breakdown consistency — all-scope total must equal sum of breakdowns
@@ -598,12 +613,19 @@ export async function processUpload(
     return { status: 'rejected', snapshots: [], error: 'Rate limited', error_code: 'rate_limited' }
   }
 
+  const riskSettings = await loadRiskSettings()
+
   const requestId = nanoid()
   const payloadHash = sha256(JSON.stringify(request))
   const ipHash = hashIp(ip)
   const snapshotResults: SnapshotResult[] = []
 
   await sql.begin(async (tx) => {
+    // One writer of a user's leaderboard rows at a time. The admin snapshot
+    // actions take the same lock (admin/operations.ts), so moderation cannot
+    // land between the visibility lookup below and the rows written after it.
+    await tx`SELECT pg_advisory_xact_lock(hashtextextended('leaderboard_metrics:' || ${userId}::text, 0))`
+
     await tx`
       INSERT INTO upload_requests (id, user_id, device_id, idempotency_key, payload_hash, status, result_summary, client_version, client_platform, schema_version, ip_hash)
       VALUES (${requestId}, ${userId}, ${deviceId}, ${idempotencyKey}, ${payloadHash}, 'accepted', ${JSON.stringify(snapshotResults)}, ${request.client_version}, ${request.client_platform}, ${request.schema_version}, ${ipHash})
@@ -613,7 +635,7 @@ export async function processUpload(
 
     for (const snapshot of request.snapshots) {
       // Run risk assessment
-      const risk = await assessRisk(tx, userId, deviceId, snapshot, pricing)
+      const risk = await assessRisk(tx, userId, deviceId, snapshot, pricing, riskSettings)
       const snapshotStatus = risk.status
 
       const snapshotId = nanoid()
@@ -630,8 +652,31 @@ export async function processUpload(
         reason_message: risk.reasonMessage,
       })
 
-      // Flagged snapshots get 'flagged' visibility; accepted get 'public'
-      const metricVisibility = snapshotStatus === 'flagged' ? 'flagged' : 'public'
+      // Flagged snapshots get 'flagged' visibility; accepted get 'public'.
+      // Admin moderation outlives the upload: a row that is hidden stays hidden
+      // in the upsert below, whatever this upload's status, and a row this
+      // upload adds (a tool or model the period did not have before) starts
+      // hidden while a snapshot of the period stands hidden or rejected, or
+      // when every existing row of the period is hidden.
+      const periodRows = await tx`
+        SELECT (
+          COALESCE(BOOL_AND(visibility = 'hidden'), FALSE)
+          OR EXISTS (
+            SELECT 1 FROM upload_snapshots hold
+            WHERE hold.user_id = ${userId}
+              AND hold.period_type = ${snapshot.period_type}
+              AND hold.period_start = ${snapshot.period_start}
+              AND hold.review_status IN ('hidden', 'rejected')
+          )
+        ) AS hidden
+        FROM leaderboard_metrics
+        WHERE user_id = ${userId}
+          AND period_type = ${snapshot.period_type}
+          AND period_start = ${snapshot.period_start}
+      `
+      const periodHidden = (periodRows[0] as { hidden: boolean }).hidden === true
+      const uploadVisibility = snapshotStatus === 'flagged' ? 'flagged' : 'public'
+      const metricVisibility = periodHidden ? 'hidden' : uploadVisibility
 
       const { costs, unknownModels } = buildCostMap(snapshot, pricing)
       for (const row of snapshot.breakdowns) {
@@ -668,7 +713,7 @@ export async function processUpload(
             thinking_tokens = ${row.thinking_tokens},
             total_tokens = ${row.total_tokens},
             total_cost_usd = ${cost},
-            visibility = ${metricVisibility},
+            visibility = CASE WHEN leaderboard_metrics.visibility = 'hidden' THEN leaderboard_metrics.visibility ELSE ${uploadVisibility} END,
             has_unknown_cost = ${hasUnknownCost},
             updated_at = NOW()
         `

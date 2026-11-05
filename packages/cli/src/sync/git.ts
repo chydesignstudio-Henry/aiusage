@@ -2,8 +2,9 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { readFile, writeFile, mkdir, readdir, stat, unlink, rm } from 'node:fs/promises'
 import { join } from 'node:path'
-import { gitCredentialOptions } from '../github/git-credentials.js'
+import { gitCredentialOptions, gitFailureSummary, GitIsolationError } from '../github/git-credentials.js'
 import { validateRepo, GitHubAuthError } from '../github/auth.js'
+import { JsonFileError } from '../json-file.js'
 
 const exec = promisify(execFile)
 
@@ -59,8 +60,9 @@ export class GitSyncBackend {
 
   private async git(args: string[], cwd?: string): Promise<string> {
     const network = ['clone', 'fetch', 'pull', 'push'].includes(args[0])
+    let token: string | undefined
     try {
-      const token = network ? await this.getToken() : undefined
+      token = network ? await this.getToken() : undefined
       const credentials = gitCredentialOptions(this.repo, token)
       const { stdout } = await exec('git', [...credentials.args, ...args], {
         cwd: cwd ?? this.cacheDir,
@@ -71,9 +73,13 @@ export class GitSyncBackend {
       // Network output is never consumed or surfaced: servers can echo secrets.
       return network ? '' : stdout.trim()
     } catch (error) {
-      if (error instanceof GitHubAuthError) throw error
-      // Never retain child-process message, stack, stdout, stderr, cmd, or cause.
-      throw new Error('GitHub Git operation failed or was rejected. Check repository access, network connectivity, and Git identity.')
+      // A config.json that stopped parsing (the token is read from it) is a
+      // locally authored message too, and names the file and the way out.
+      if (error instanceof GitHubAuthError || error instanceof GitIsolationError || error instanceof JsonFileError) throw error
+      // Never retain child-process message, stack, stdout, stderr, cmd, or cause:
+      // only a sanitized one-line summary is surfaced (fixed phrases for network commands).
+      const detail = gitFailureSummary(error, { network, token })
+      throw new Error(`GitHub Git operation failed or was rejected${detail ? ` (git ${args[0]}: ${detail})` : ''}. Check repository access, network connectivity, and Git identity.`)
     }
   }
 

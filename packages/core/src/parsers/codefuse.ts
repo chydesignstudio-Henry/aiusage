@@ -1,6 +1,6 @@
 import type { Parser, ParseResult, ParseContext } from '../types.js'
 import type { StatsRecord, ToolCallRecord } from '../types.js'
-import { generateRecordId, generateToolCallId, generateOrphanToolCallId } from '../record-id.js'
+import { recordIdFor, generateToolCallId, generateOrphanToolCallId } from '../record-id.js'
 import { inferProvider } from '../provider.js'
 import { calculateCost, resolvePrice } from '../pricing.js'
 import { normalizeCodeFuseModel } from '../codefuse-model.js'
@@ -59,12 +59,19 @@ function usageFromNative(parsed: any): UsageParts | null {
 function usageFromCodexPayload(payload: any): UsageParts | null {
   const usage = payload?.last_token_usage ?? payload?.info?.last_token_usage
   if (!usage || typeof usage !== 'object') return null
+  // Codex reports input_tokens inclusive of cached_input_tokens. Store only the
+  // uncached part so cached tokens are not counted (and priced) twice.
+  const cachedTokens = num(usage.cached_input_tokens)
+  // output_tokens likewise includes reasoning_output_tokens. Thinking tokens
+  // are summed and priced beside output tokens, so store only the
+  // non-reasoning part as output.
+  const reasoningTokens = num(usage.reasoning_output_tokens)
   return {
-    inputTokens: num(usage.input_tokens),
-    outputTokens: num(usage.output_tokens),
-    cacheReadTokens: num(usage.cached_input_tokens),
+    inputTokens: Math.max(0, num(usage.input_tokens) - cachedTokens),
+    outputTokens: Math.max(0, num(usage.output_tokens) - reasoningTokens),
+    cacheReadTokens: cachedTokens,
     cacheWriteTokens: 0,
-    thinkingTokens: num(usage.reasoning_output_tokens),
+    thinkingTokens: reasoningTokens,
   }
 }
 
@@ -230,8 +237,8 @@ export class CodeFuseParser implements Parser {
     const cost = hasPrice ? calculateCost(model, usage, context.exchangeRate) : 0
     const recordTs = parseTimestamp(options.rawTs, context.now)
     const recordId = options.idSeed
-      ? generateRecordId(context.deviceInstanceId, options.idSeed, 0)
-      : generateRecordId(context.deviceInstanceId, context.sourceFile, context.lineOffset)
+      ? recordIdFor(context, options.idSeed, 0)
+      : recordIdFor(context, context.sourceFile, context.lineOffset)
 
     const record: StatsRecord = {
       id: recordId,

@@ -9,7 +9,8 @@ import { runSync, runSyncRepair, formatRepairReport, formatForgetTargetReport, s
 import { generateSummary } from './commands/summary.js'
 import { generateStatus } from './commands/status.js'
 import { exportData } from './commands/export.js'
-import { cleanOldData, cleanAll, getRemoteBackends, propagateClean } from './commands/clean.js'
+import { DateOptionError, resolveDateBounds, type DateBounds, type DateOptions } from './commands/date-options.js'
+import { cleanOldData, cleanAll, getRemoteBackends, cleanReachesBackend, propagateClean } from './commands/clean.js'
 import { recalcPricing } from './commands/recalc.js'
 import { runParse } from './commands/parse.js'
 import { ProgressReporter, SyncProgressReporter } from './progress.js'
@@ -21,12 +22,29 @@ import { runLeaderboardLogout } from './commands/leaderboard-logout.js'
 import { runLeaderboardView } from './commands/leaderboard-view.js'
 import { runMenu } from './commands/menu.js'
 import { createDatabase } from './db/index.js'
-import { getState } from './init.js'
-import { AIUSAGE_DIR } from './config.js'
+import { ensureAiusageDir, getState } from './init.js'
+import { AIUSAGE_DIR, loadConfig } from './config.js'
+import { JsonFileError } from './json-file.js'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const DB_PATH = join(AIUSAGE_DIR, 'cache.db')
+
+/**
+ * The `ts` bounds for the date options of `summary` and `export`. A date the
+ * command cannot use ends it with a message, like the other option checks here.
+ * `--week` starts on the dashboard's configured first day of the week.
+ */
+function dateBoundsOrExit(options: DateOptions): DateBounds {
+  try {
+    const weekStart = options.range === 'week' ? (loadConfig()?.weekStart ?? 1) as 0 | 1 : 1
+    return resolveDateBounds(options, weekStart)
+  } catch (error) {
+    if (!(error instanceof DateOptionError)) throw error
+    console.error(error.message)
+    process.exit(1)
+  }
+}
 
 const program = new Command()
 
@@ -36,6 +54,15 @@ program
   .name('aiusage')
   .version(typeof __VERSION__ !== 'undefined' ? __VERSION__ : 'dev')
   .description('CLI tool for AI usage statistics')
+
+// Every command starts with a device identity on disk. Nothing else creates
+// `state.json` up front, and `aiusage sync` refuses to run without one. An
+// existing file is left alone, and a failure here is the command's to report.
+program.hook('preAction', () => {
+  try {
+    ensureAiusageDir(AIUSAGE_DIR)
+  } catch {}
+})
 
 // Default command: summary
 program
@@ -84,12 +111,23 @@ program
   .option('--device <id>', 'Filter by device instance ID')
   .option('--tool <tool>', 'Filter by any supported tool id')
   .action((options) => {
+    if (options.week && options.month) {
+      console.error('Cannot use --week and --month together. Use one or the other.')
+      process.exit(1)
+    }
+    const range = options.week ? 'week' : options.month ? 'month' : undefined
+    if (range && (options.from !== undefined || options.to !== undefined)) {
+      console.error(`Cannot use --${range} with --from or --to.`)
+      process.exit(1)
+    }
+    const bounds = dateBoundsOrExit({ range, from: options.from, to: options.to })
     const db = createDatabase(DB_PATH)
     const state = getState(AIUSAGE_DIR)
     const summary = generateSummary(db, {
       currentDeviceInstanceId: state?.deviceInstanceId,
       device: options.device,
       tool: options.tool,
+      ...bounds,
     })
     if (summary.deviceLabel) {
       console.log(`设备：${summary.deviceLabel}`)
@@ -144,8 +182,18 @@ program
       console.error('Invalid format. Use csv, json, or ndjson.')
       process.exit(1)
     }
+    const range = options.range as DateOptions['range']
+    if (range !== undefined && !['day', 'week', 'month'].includes(range)) {
+      console.error('Invalid range. Use day, week, or month.')
+      process.exit(1)
+    }
+    if (range !== undefined && (options.from !== undefined || options.to !== undefined)) {
+      console.error('Cannot use --range with --from or --to.')
+      process.exit(1)
+    }
+    const bounds = dateBoundsOrExit({ range, from: options.from, to: options.to })
     const db = createDatabase(DB_PATH)
-    const data = exportData(db, format)
+    const data = exportData(db, format, bounds)
     if (options.output) {
       writeFileSync(options.output, data, 'utf-8')
       console.log(`Exported to ${options.output}`)
@@ -170,6 +218,9 @@ program
       })
       reporter?.done()
       console.log(`Parsed ${result.parsedCount} records, ${result.toolCallCount} tool calls.`)
+      for (const warning of result.warnings) {
+        console.warn(`Warning: ${warning}`)
+      }
       if (result.errors.length > 0) {
         console.warn(`${result.errors.length} errors encountered.`)
       }
@@ -210,7 +261,11 @@ program
       days = parseInt(daysMatch[1], 10)
     }
 
-    const remoteBackends = localOnly ? [] : getRemoteBackends()
+    const configuredBackends = localOnly ? [] : getRemoteBackends()
+    // A partial clean cannot reach the cloud backend, which can only be
+    // cleared as a whole. It is named below and otherwise left out.
+    const remoteBackends = configuredBackends.filter(rb => cleanReachesBackend(rb, isAll))
+    const untouchedBackends = configuredBackends.filter(rb => !cleanReachesBackend(rb, isAll))
 
     // Print warning
     if (isAll) {
@@ -230,6 +285,12 @@ program
       for (const rb of remoteBackends) {
         console.log(`  - ${rb.label}`)
       }
+    }
+
+    for (const rb of untouchedBackends) {
+      console.log(`\n${rb.label} has no partial delete: --before leaves its data untouched.`)
+      console.log('  Records removed here stay in the cloud, and the next sync can bring records of other devices back.')
+      console.log('  Use --all to clear the cloud as well.')
     }
 
     // Confirmation
@@ -256,7 +317,10 @@ program
           process.exit(0)
         }
       } else {
-        const answer = await ask('\n? Confirm? [y/N] ')
+        const question = untouchedBackends.length > 0
+          ? '\n? Confirm local deletion (cloud data is left untouched)? [y/N] '
+          : '\n? Confirm? [y/N] '
+        const answer = await ask(question)
         if (answer.toLowerCase() !== 'y') {
           console.log('Cancelled.')
           process.exit(0)
@@ -300,16 +364,21 @@ program
         for (const r of propagation.backends) {
           if (r.status === 'ok') {
             console.log(`  ${r.backend.label}: ${r.detail}`)
+          } else if (r.status === 'failed') {
+            console.error(`  ${r.backend.label}: failed — ${r.detail}. The remote data was not removed; run the command again to retry.`)
+            process.exitCode = 1
           } else {
             console.log(`  ${r.backend.label}: skipped — ${r.detail}`)
           }
         }
       } catch (err) {
+        if (err instanceof JsonFileError) throw err
         console.error(`  Propagation failed: ${err instanceof Error ? err.message : err}`)
+        process.exitCode = 1
       }
     }
 
-    console.log('\nDone.')
+    console.log(process.exitCode ? '\nDone locally; the remote clean did not complete.' : '\nDone.')
   })
 
 // recalc command
@@ -317,10 +386,10 @@ program
   .command('recalc')
   .description('Recalculate costs')
   .option('--pricing', 'Recalculate using latest pricing')
-  .action(() => {
+  .action(async () => {
     const db = createDatabase(DB_PATH)
-    const result = recalcPricing(db)
-    console.log(`Updated ${result.updatedCount} records, skipped ${result.skippedCount}.`)
+    const result = await recalcPricing(db, { currentDeviceInstanceId: getState(AIUSAGE_DIR)?.deviceInstanceId })
+    console.log(`Updated ${result.updatedCount} records, skipped ${result.skippedCount}, updated ${result.syncedUpdatedCount} synced records.`)
     db.close()
   })
 
@@ -339,7 +408,7 @@ program
 program
   .command('init')
   .description('Configure cloud sync')
-  .option('--backend <backend>', 'Sync backend (cloud|github|s3|skip)')
+  .option('--backend <backend>', 'Sync backend (cloud|github|s3), or skip to remove the sync configuration')
   .option('--repo <repo>', 'GitHub repository (format: username/repo-name)')
   .option('--token <token>', 'Advanced PAT fallback (prefer AIUSAGE_GITHUB_TOKEN to avoid shell history)')
   .option('--bucket <bucket>', 'S3 bucket name')
@@ -355,11 +424,11 @@ program
         const existing = runInit(options)
         if (existing.success) { console.log(existing.message); return }
         await runGitHubLogin(options)
-      } catch (error) { console.error(safeGitHubError(error)); process.exitCode = 1 }
+      } catch (error) { if (error instanceof JsonFileError) throw error; console.error(safeGitHubError(error)); process.exitCode = 1 }
       return
     }
     let result
-    try { result = runInit(options) } catch { console.error('Cannot securely save credentials. Check the OS keychain.'); process.exitCode = 1; return }
+    try { result = runInit(options) } catch (error) { if (error instanceof JsonFileError) throw error; console.error('Cannot securely save credentials. Check the OS keychain.'); process.exitCode = 1; return }
     if (result.success) {
       console.log(`✓ ${result.message}`)
     } else {
@@ -374,7 +443,7 @@ program.command('github').description('Manage local GitHub sync authentication')
   .option('--repo <owner/repo>', 'Select the sync repository (required in headless mode)')
   .action(async (options) => {
     try { await runGitHubLogin(options) }
-    catch (error) { console.error(safeGitHubError(error)); process.exitCode = 1 }
+    catch (error) { if (error instanceof JsonFileError) throw error; console.error(safeGitHubError(error)); process.exitCode = 1 }
   })
 
 program
@@ -423,6 +492,12 @@ program
         }
         if (ignored) {
           console.log('  Some remote lines belong to a different device than the namespace they are in. Run "aiusage sync --repair" for details.')
+        }
+        if ('rejectedCount' in result && result.rejectedCount) {
+          console.log(`  Note: ${result.rejectedCount} local record(s) were not uploaded: the cloud cannot store them (a missing tool or model, or a value out of range). They stay on this device as unsynced and are sent again with the next sync.`)
+        }
+        if ('unretiredCount' in result && result.unretiredCount) {
+          console.log(`  Note: ${result.unretiredCount} stale remote record(s) could not be retracted: the cloud did not apply their deletion. They are retracted again with the next sync.`)
         }
         if ('collisionCount' in result && result.collisionCount) {
           console.log(`  WARNING: ${result.collisionCount} local record(s) share a sync id with another record and were not uploaded. Run "aiusage sync --repair" for details.`)
@@ -601,5 +676,21 @@ program
       process.exit(1)
     }
   })
+
+/**
+ * Run the command line. A `config.json` or `state.json` that exists but
+ * cannot be used ends the command with its message — which names the file,
+ * the problem and how to recover — and a non-zero exit code, instead of a
+ * stack trace. Any other error is not handled here.
+ */
+export async function runCli(argv: string[]): Promise<void> {
+  try {
+    await program.parseAsync(argv)
+  } catch (error) {
+    if (!(error instanceof JsonFileError)) throw error
+    console.error(`✗ ${error.message}`)
+    process.exit(1)
+  }
+}
 
 export { program }

@@ -5,9 +5,13 @@ import {
   setRuntimePriceTable,
   setPriceOverride,
   resolvePriceFromTable,
+  planLitellmPricing,
+  type LitellmEntry,
   type PriceEntry,
 } from '@aiusage/core'
 import type { Config } from './config.js'
+
+export { planLitellmPricing, type LitellmPricingPlan } from '@aiusage/core'
 
 const LITELLM_PRICING_URL = 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json'
 
@@ -52,17 +56,6 @@ interface AliasRow {
   source: string
   origin: 'builtin' | 'user'
   enabled: number
-}
-
-interface LitellmEntry {
-  input_cost_per_token?: number
-  output_cost_per_token?: number
-  cache_read_input_token_cost?: number
-  cache_creation_input_token_cost?: number
-  input_cost_per_second?: number
-  output_cost_per_second?: number
-  litellm_provider?: string
-  mode?: string
 }
 
 export interface PricingSyncSummary {
@@ -143,43 +136,6 @@ function rowToPrice(row: Pick<ModelPriceRow, 'input' | 'output' | 'cache_read' |
     cacheRead: row.cache_read == null ? undefined : Number(row.cache_read),
     cacheWrite: row.cache_write == null ? undefined : Number(row.cache_write),
     currency: row.currency,
-  }
-}
-
-function normalizeProvider(provider: string | undefined): string {
-  return (provider ?? '').trim().toLowerCase()
-}
-
-function normalizeModelKey(sourceModelId: string): string {
-  const trimmed = sourceModelId.trim()
-  const slash = trimmed.indexOf('/')
-  return slash > 0 ? trimmed.slice(slash + 1) : trimmed
-}
-
-function aliasesFor(sourceModelId: string, modelKey: string): string[] {
-  const aliases = new Set<string>([modelKey, sourceModelId])
-  if (modelKey.startsWith('claude-')) aliases.add(modelKey.replace(/-\d{8}$/, ''))
-  return [...aliases].filter(Boolean)
-}
-
-function litellmEntryToPrice(sourceModelId: string, entry: LitellmEntry): { modelKey: string; provider: string; price: PriceEntry } | null {
-  if (entry.mode && entry.mode !== 'chat' && entry.mode !== 'completion' && entry.mode !== 'responses') return null
-  if (entry.input_cost_per_second != null || entry.output_cost_per_second != null) return null
-  if (typeof entry.input_cost_per_token !== 'number' || typeof entry.output_cost_per_token !== 'number') return null
-
-  const modelKey = normalizeModelKey(sourceModelId)
-  if (!modelKey || modelKey.includes('*')) return null
-
-  return {
-    modelKey,
-    provider: normalizeProvider(entry.litellm_provider),
-    price: {
-      input: entry.input_cost_per_token * 1_000_000,
-      output: entry.output_cost_per_token * 1_000_000,
-      cacheRead: typeof entry.cache_read_input_token_cost === 'number' ? entry.cache_read_input_token_cost * 1_000_000 : undefined,
-      cacheWrite: typeof entry.cache_creation_input_token_cost === 'number' ? entry.cache_creation_input_token_cost * 1_000_000 : undefined,
-      currency: 'USD',
-    },
   }
 }
 
@@ -622,27 +578,33 @@ export async function syncPricingFromLitellm(db: Database.Database): Promise<Pri
     dryRun: { totalModels: 0, matched: 0, unresolved: [] },
   }
 
-  const tx = db.transaction(() => {
-    for (const [sourceModelId, rawEntry] of Object.entries(data)) {
-      const parsed = litellmEntryToPrice(sourceModelId, rawEntry)
-      if (!parsed) { summary.skipped++; continue }
+  const plan = planLitellmPricing(data)
+  summary.skipped = plan.skipped
 
+  const tx = db.transaction(() => {
+    for (const entry of plan.prices) {
       const result = upsertBuiltinPrice(db, {
-        modelKey: parsed.modelKey,
-        provider: parsed.provider,
-        price: parsed.price,
-        sourceModelId,
+        modelKey: entry.modelKey,
+        provider: entry.provider,
+        price: entry.price,
+        sourceModelId: entry.sourceModelId,
         sourceUrl: LITELLM_PRICING_URL,
       }, now)
       if (result === 'user_preserved') summary.userPreserved++
       else summary[result]++
+    }
 
-      for (const alias of aliasesFor(sourceModelId, parsed.modelKey)) {
-        const aliasResult = upsertBuiltinAlias(db, alias, parsed.modelKey, parsed.provider, 'litellm', now)
-        if (aliasResult === 'added') summary.aliasesAdded++
-        else if (aliasResult === 'updated') summary.aliasesUpdated++
-        else if (aliasResult === 'user_preserved') summary.userPreserved++
-      }
+    // A dated shortcut must not sit on a name that has a price the file does
+    // not list (a curated price, or a row an earlier sync left): point the
+    // alias at that row instead, which also repairs a shortcut written earlier.
+    const ownPrice = db.prepare("SELECT provider FROM model_prices WHERE model_key = ? AND status = 'active'")
+    for (const planned of plan.aliases) {
+      const own = planned.datedShortcut ? ownPrice.get(planned.alias) as ({ provider: string } | undefined) : undefined
+      const alias = own ? { alias: planned.alias, modelKey: planned.alias, provider: own.provider } : planned
+      const aliasResult = upsertBuiltinAlias(db, alias.alias, alias.modelKey, alias.provider, 'litellm', now)
+      if (aliasResult === 'added') summary.aliasesAdded++
+      else if (aliasResult === 'updated') summary.aliasesUpdated++
+      else if (aliasResult === 'user_preserved') summary.userPreserved++
     }
     summary.aliasesAdded += ensureCuratedPricingAliases(db)
   })
@@ -661,37 +623,79 @@ function priceTableFromDb(db: Database.Database): Record<string, PriceEntry> {
   return table
 }
 
-/**
- * Whether the user has explicitly configured a manual price for this exact model.
- * Used by recalc to let a user-defined price override a tool's logged cost
- * (e.g. unreliable near-zero costs reported by custom gateways). See issue #13.
- */
-export function hasUserPrice(db: Database.Database, model: string): boolean {
-  const row = db.prepare(`
-    SELECT 1 FROM model_prices
-    WHERE model_key = ? AND origin = 'user' AND status = 'active'
-    LIMIT 1
-  `).get(model)
-  return Boolean(row)
+export function resolvePriceFromRegistry(db: Database.Database, model: string): PriceEntry | undefined {
+  return createRegistryPriceLookup(db).price(model)
 }
 
-export function resolvePriceFromRegistry(db: Database.Database, model: string): PriceEntry | undefined {
+export interface RegistryPriceLookup {
+  /**
+   * The model's price: its direct user price, else the price of its exact
+   * alias, else a match in the full price table (`resolvePriceFromTable`).
+   */
+  price(model: string): PriceEntry | undefined
+  /**
+   * Whether the user has explicitly configured a manual price for this exact model.
+   * Used by recalc to let a user-defined price override a tool's logged cost
+   * (e.g. unreliable near-zero costs reported by custom gateways). See issue #13.
+   */
+  hasUserPrice(model: string): boolean
+}
+
+/**
+ * Registry lookups for one pass over many records, such as a recalculation.
+ * Each model is looked up once, and the full price table, which only a model
+ * with neither a direct user price nor an exact alias needs, is read at most
+ * once instead of once per lookup. Each answer describes the registry as it
+ * was when the model was first looked up, so make a new lookup for each pass.
+ */
+export function createRegistryPriceLookup(db: Database.Database): RegistryPriceLookup {
+  type PriceColumns = Pick<ModelPriceRow, 'input' | 'output' | 'cache_read' | 'cache_write' | 'currency'>
   const directUserPrice = db.prepare(`
     SELECT input, output, cache_read, cache_write, currency
     FROM model_prices
     WHERE model_key = ? AND origin = 'user' AND status = 'active'
-  `).get(model) as (Pick<ModelPriceRow, 'input' | 'output' | 'cache_read' | 'cache_write' | 'currency'> | undefined)
-  if (directUserPrice) return rowToPrice(directUserPrice)
-
+  `)
   const exactAlias = db.prepare(`
     SELECT p.input, p.output, p.cache_read, p.cache_write, p.currency
     FROM model_price_aliases a
     JOIN model_prices p ON p.model_key = a.model_key
     WHERE a.alias = ? AND a.enabled = 1 AND p.status = 'active'
     ORDER BY a.priority DESC LIMIT 1
-  `).get(model) as (Pick<ModelPriceRow, 'input' | 'output' | 'cache_read' | 'cache_write' | 'currency'> | undefined)
-  if (exactAlias) return rowToPrice(exactAlias)
-  return resolvePriceFromTable(model, priceTableFromDb(db))
+  `)
+  const userPrices = new Map<string, PriceEntry | null>()
+  const prices = new Map<string, PriceEntry | null>()
+  let table: Record<string, PriceEntry> | undefined
+
+  const userPrice = (model: string): PriceEntry | null => {
+    let entry = userPrices.get(model)
+    if (entry === undefined) {
+      const row = directUserPrice.get(model) as PriceColumns | undefined
+      entry = row ? rowToPrice(row) : null
+      userPrices.set(model, entry)
+    }
+    return entry
+  }
+
+  const resolve = (model: string): PriceEntry | undefined => {
+    const direct = userPrice(model)
+    if (direct) return direct
+    const alias = exactAlias.get(model) as PriceColumns | undefined
+    if (alias) return rowToPrice(alias)
+    table ??= priceTableFromDb(db)
+    return resolvePriceFromTable(model, table)
+  }
+
+  return {
+    price(model) {
+      let entry = prices.get(model)
+      if (entry === undefined) {
+        entry = resolve(model) ?? null
+        prices.set(model, entry)
+      }
+      return entry ?? undefined
+    },
+    hasUserPrice: (model) => userPrice(model) !== null,
+  }
 }
 
 function findMatch(db: Database.Database, model: string): { price: PriceEntry; row: ModelPriceRow; matchedBy: string | null } | null {
@@ -908,10 +912,11 @@ export function listLocalModelBindings(db: Database.Database): PricingLocalModel
 
 export function dryRunLocalModels(db: Database.Database): PricingSyncSummary['dryRun'] {
   const models = db.prepare("SELECT DISTINCT model FROM records WHERE model != 'unknown' ORDER BY model ASC").all() as Array<{ model: string }>
+  const prices = createRegistryPriceLookup(db)
   const unresolved: string[] = []
   let matched = 0
   for (const row of models) {
-    if (resolvePriceFromRegistry(db, row.model)) matched++
+    if (prices.price(row.model)) matched++
     else unresolved.push(row.model)
   }
   return { totalModels: models.length, matched, unresolved: unresolved.slice(0, 50) }

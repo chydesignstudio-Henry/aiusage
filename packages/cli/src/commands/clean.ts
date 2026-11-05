@@ -2,6 +2,7 @@ import type Database from 'better-sqlite3'
 import { unlinkSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { AIUSAGE_DIR, loadConfig } from '../config.js'
+import { JsonFileError } from '../json-file.js'
 import type { SyncRecord } from '@aiusage/core'
 import { cloudClear } from '../sync/cloud.js'
 import type { SyncBackend } from '../sync/index.js'
@@ -32,7 +33,8 @@ export interface RemoteBackend {
 }
 
 export interface CleanPropagationResult {
-  backends: Array<{ backend: RemoteBackend; status: 'ok' | 'skipped'; detail?: string }>
+  /** `skipped`: not attempted, by design. `failed`: attempted, and the remote data may still be there. */
+  backends: Array<{ backend: RemoteBackend; status: 'ok' | 'skipped' | 'failed'; detail?: string }>
 }
 
 export function cleanOldData(db: Database.Database, days: number): CleanResult {
@@ -101,6 +103,15 @@ export function getRemoteBackends(): RemoteBackend[] {
   }
 
   return backends
+}
+
+/**
+ * Whether a clean changes anything on `backend`. The cloud backend can only be
+ * cleared as a whole (every record of every device), so a partial clean
+ * (`--before`) leaves it alone; the file-based backends support both.
+ */
+export function cleanReachesBackend(backend: RemoteBackend, all: boolean): boolean {
+  return all || backend.type !== 'cloud'
 }
 
 
@@ -219,6 +230,16 @@ export async function propagateClean(options: {
 
   if (config.sync.backend === 'cloud') {
     if (!options.target || options.target === 'cloud') {
+      // `cloudClear()` drops every record of every device, so it is only the
+      // right call for `--all`.
+      if (!options.all) {
+        results.push({
+          backend: { type: 'cloud', label: 'AIUsage Cloud' },
+          status: 'skipped',
+          detail: 'no partial delete, cloud data left untouched (use --all to clear it)',
+        })
+        return { backends: results }
+      }
       try {
         const result = await cloudClear()
         results.push({
@@ -229,7 +250,7 @@ export async function propagateClean(options: {
       } catch (err) {
         results.push({
           backend: { type: 'cloud', label: 'AIUsage Cloud' },
-          status: 'skipped',
+          status: 'failed',
           detail: err instanceof Error ? err.message : 'unknown error',
         })
       }
@@ -282,12 +303,14 @@ export async function propagateClean(options: {
       })
     }
   } catch (err) {
+    // Not a backend that was skipped: the configuration itself cannot be used.
+    if (err instanceof JsonFileError) throw err
     results.push({
       backend: {
         type: config.sync.backend as 'github' | 's3',
         label: config.sync.backend === 'github' ? `GitHub (${config.sync.repo})` : `S3 (${config.sync.bucket})`,
       },
-      status: 'skipped',
+      status: 'failed',
       detail: err instanceof Error ? err.message : 'unknown error',
     })
   }

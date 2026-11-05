@@ -5,6 +5,8 @@ import { loadConfig, saveConfig, buildConsentConfig, AIUSAGE_DIR, type Config } 
 import { hasCredentials } from '../leaderboard/credentials.js'
 import { getSyncTarget } from '../sync/target.js'
 import { setPat, validateRepo } from '../github/auth.js'
+import { saveGitHubCredentials } from '../github/credentials.js'
+import { withSettingsLock } from '../settings-lock.js'
 
 export interface InitOptions {
   backend?: 'github' | 's3' | 'cloud' | 'skip'
@@ -21,16 +23,53 @@ export interface InitOptions {
   secretAccessKey?: string
 }
 
+/**
+ * Builds the new configuration from the one on disk and saves it, with the
+ * consent in state.json, under the settings lock: a change another process
+ * (`aiusage serve`) saves at the same time is not written over.
+ */
 export function runInit(options: InitOptions): { success: boolean; message: string } {
+  // The token goes to the OS keychain first, outside the lock: the keychain
+  // can wait on the user (an access prompt), and `aiusage serve` must not wait
+  // on that to record a sync.
+  let patCredentialId: string | undefined
+  if (options.backend === 'github' && options.token && options.repo) {
+    try { validateRepo(options.repo) } catch { return { success: false, message: 'Invalid GitHub repository. Use owner/repo.' } }
+    patCredentialId = saveGitHubCredentials({ method: 'pat', accessToken: options.token })
+  }
+  return withSettingsLock(AIUSAGE_DIR, () => initConfig(options, patCredentialId))
+}
+
+function initConfig(options: InitOptions, patCredentialId?: string): { success: boolean; message: string } {
   const existingConfig = loadConfig()
 
-  if (options.backend === 'skip' || !options.backend) {
+  if (!options.backend) {
+    // No backend named: the sync setup stays as it is, and only what was
+    // passed (the device alias) changes.
     const config: Config = {
+      ...existingConfig,
       device: options.device ?? existingConfig?.device,
       platform: existingConfig?.platform ?? platform(),
-      retentionDays: existingConfig?.retentionDays,
-      refreshInterval: existingConfig?.refreshInterval,
-      credentials: existingConfig?.credentials,
+    }
+    saveConfig(config)
+    if (config.sync) {
+      return {
+        success: true,
+        message: `Configuration saved. Sync settings unchanged (${config.sync.backend}).\nRun "aiusage init --backend cloud|github|s3" to change them, or "aiusage init --backend skip" to remove them.`,
+      }
+    }
+    return {
+      success: true,
+      message: 'Configuration saved without cloud sync.\nRun "aiusage init --backend cloud|github|s3" to configure it.',
+    }
+  }
+
+  if (options.backend === 'skip') {
+    const { sync: _sync, ...withoutSync } = existingConfig ?? {}
+    const config: Config = {
+      ...withoutSync,
+      device: options.device ?? existingConfig?.device,
+      platform: existingConfig?.platform ?? platform(),
     }
     saveConfig(config)
     return { success: true, message: 'Configuration saved without cloud sync.' }
@@ -42,14 +81,12 @@ export function runInit(options: InitOptions): { success: boolean; message: stri
     }
 
     const config: Config = {
+      ...existingConfig,
       sync: {
         backend: 'cloud',
       },
       device: options.device ?? existingConfig?.device,
       platform: existingConfig?.platform ?? platform(),
-      retentionDays: existingConfig?.retentionDays,
-      refreshInterval: existingConfig?.refreshInterval,
-      credentials: existingConfig?.credentials,
     }
 
     saveConfig(config)
@@ -86,7 +123,7 @@ export function runInit(options: InitOptions): { success: boolean; message: stri
       },
     }
 
-    if (options.token) setPat(config, options.token)
+    if (options.token) setPat(config, options.token, patCredentialId)
 
     const consentConfig = buildConsentConfig(config)
     if (!consentConfig) {
@@ -120,6 +157,7 @@ export function runInit(options: InitOptions): { success: boolean; message: stri
     }
 
     const config: Config = {
+      ...existingConfig,
       sync: {
         backend: 's3',
         bucket: options.bucket,
@@ -130,8 +168,6 @@ export function runInit(options: InitOptions): { success: boolean; message: stri
       },
       device: options.device ?? existingConfig?.device,
       platform: existingConfig?.platform ?? platform(),
-      retentionDays: existingConfig?.retentionDays,
-      refreshInterval: existingConfig?.refreshInterval,
       credentials: {
         ...existingConfig?.credentials,
         [`s3/${options.bucket}/accessKeyId`]: options.accessKeyId,

@@ -2,10 +2,10 @@ import Database from 'better-sqlite3'
 import { readFileSync, statSync, existsSync, openSync, readSync, closeSync } from 'node:fs'
 import { basename, join, dirname } from 'node:path'
 import { hostname } from 'node:os'
-import { Aggregator, resolveExchangeRate, generateToolCallId, inferProvider, calculateCost, resolvePrice, generateRecordId, normalizeCodeFuseModel, parseTimestamp, type StatsRecord, type Tool } from '@aiusage/core'
+import { Aggregator, resolveExchangeRate, generateToolCallId, claudeCodeToolCall, inferProvider, calculateCost, resolvePrice, recordIdFor, normalizeCodeFuseModel, parseTimestamp, type RecordIdBuilder, type StatsRecord, type Tool } from '@aiusage/core'
 import type { ToolCallRecord } from '@aiusage/core'
-import { insertRecord, LOCAL_RECORDS_WHERE, backfillUnknownDeviceInstanceId } from '../db/records.js'
-import { insertToolCall } from '../db/tool-calls.js'
+import { insertChangedRecords, insertRecord, LOCAL_RECORDS_WHERE, backfillUnknownDeviceInstanceId, recordIdsForReread, type RereadRecordIds } from '../db/records.js'
+import { insertToolCall, deleteAdoptedToolCall, deletePositionalCounterpart, hasPositionalToolCallId } from '../db/tool-calls.js'
 import { getState } from '../init.js'
 import { loadConfig, AIUSAGE_DIR } from '../config.js'
 import { WatermarkManager } from '../watermark.js'
@@ -16,7 +16,7 @@ import { runParseQoder } from './parse-qoder.js'
 import { runParseCursor } from './parse-cursor.js'
 import { runParseCursorTranscript } from './parse-cursor.js'
 import { runParseKilo } from './parse-kilo.js'
-import { runParseKelivo } from './parse-kelivo.js'
+import { isKelivoDatabaseFile, isKelivoSourceFile, runParseKelivo } from './parse-kelivo.js'
 import { runParseGoose } from './parse-goose.js'
 import { runParseZed } from './parse-zed.js'
 import { runParseKiro } from './parse-kiro.js'
@@ -24,12 +24,15 @@ import { runParseZcode } from './parse-zcode.js'
 import { runParseTrae } from './parse-trae.js'
 import { runParseCodeBuddy } from './parse-codebuddy.js'
 import { runParseAntigravity } from './parse-antigravity.js'
+import { cursorTranscriptComposerId, deleteCursorTranscriptEstimates, hasCursorDatabaseRecord, kiroLogLineId, prefixFingerprint, repairImporterDuplicates, replaceKiroLogLines, replaceSourceRecords, replaceSourceSnapshot } from './importer-duplicates.js'
 import type { ProgressInfo } from '../progress.js'
 
 interface ParseResult {
   parsedCount: number
   toolCallCount: number
   errors: string[]
+  /** Imports that succeeded but may be incomplete (e.g. a Kelivo database whose WAL is missing). */
+  warnings: string[]
 }
 
 interface ToolPaths {
@@ -125,6 +128,7 @@ function parseUiMessagesFile(options: {
   tool: 'roocode' | 'kilocode'
   device: string
   deviceInstanceId: string
+  recordId?: RecordIdBuilder
   platform?: string
   now: number
   exchangeRate?: number
@@ -169,7 +173,7 @@ function parseUiMessagesFile(options: {
       ? payload.inferenceProvider.trim().toLowerCase()
       : inferProvider(model)
     const ts = typeof message.ts === 'number' ? message.ts : now
-    const recordId = generateRecordId(deviceInstanceId, `${filePath}:${index}`, ts)
+    const recordId = recordIdFor(options, `${filePath}:${index}`, ts)
     const tokenArgs = { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, thinkingTokens }
     const calculatedCost = model !== 'unknown' ? calculateCost(model, tokenArgs, exchangeRate) : 0
     const logCost = Number(payload.cost)
@@ -213,12 +217,126 @@ function normalizeKiroModel(value: unknown): string {
     .replace(/-\d{8}-v\d+(?:-\d+)?$/i, '')
 }
 
-function codeFuseSnapshotRecordId(deviceInstanceId: string, sessionId: string): string {
-  return generateRecordId(deviceInstanceId, `codefuse:snapshot:${sessionId}`, 0)
+/**
+ * Store records of an import that reads rows again, each with the tool calls
+ * read for it now. A tool call's id contains its position among the calls of
+ * its record, so a call that appears in front of stored ones (a part that
+ * could not be read before) would shift them to new ids and leave the old
+ * rows behind. All calls of such a record come from the one row it was built
+ * from, so its stored calls are replaced as a whole.
+ *
+ * That holds only for a complete read. For a record in
+ * `incompleteRecordIds` part of the source could not be read, and the calls
+ * read now may be short of some: the calls stored for it are left as they
+ * are and the ones read now are dropped, since they could neither replace
+ * the stored ones nor be added to them without counting calls twice. When
+ * nothing is stored for the record yet, what could be read is stored. The
+ * importer reads such a record again, and the first complete read replaces
+ * whatever is stored.
+ *
+ * Returns how many records were added or changed and how many tool calls
+ * were stored that were not stored before, so a row read again unchanged is
+ * not counted as parsed again. A record has changed when `insertRecord`
+ * moved its `updated_at`. Unlike `insertChangedRecords`, that also counts
+ * `source_file`, in which Hermes keeps the session title.
+ */
+function insertRecordsWithToolCalls(
+  db: Database.Database,
+  records: StatsRecord[],
+  toolCalls: ToolCallRecord[],
+  incompleteRecordIds: string[],
+): { records: number; toolCalls: number } {
+  const incomplete = new Set(incompleteRecordIds)
+  const storedVersion = db.prepare('SELECT updated_at FROM records WHERE id = ?').pluck()
+  const storedToolCallIds = db.prepare('SELECT id FROM tool_calls WHERE record_id = ?').pluck()
+  const removeToolCalls = db.prepare('DELETE FROM tool_calls WHERE record_id = ?')
+  return db.transaction(() => {
+    let written = 0
+    const kept = new Set<string>()
+    const replaced = new Set<string>()
+    for (const record of records) {
+      const before = storedVersion.get(record.id)
+      insertRecord(db, record)
+      if (before === undefined || storedVersion.get(record.id) !== before) written++
+      const stored = storedToolCallIds.all(record.id) as string[]
+      if (incomplete.has(record.id) && stored.length > 0) {
+        kept.add(record.id)
+        continue
+      }
+      for (const id of stored) replaced.add(id)
+      removeToolCalls.run(record.id)
+    }
+    let added = 0
+    for (const tc of toolCalls) {
+      if (tc.recordId !== null && kept.has(tc.recordId)) continue
+      insertToolCall(db, tc)
+      if (!replaced.has(tc.id)) added++
+    }
+    return { records: written, toolCalls: added }
+  })()
 }
 
-function deleteCodeFuseSnapshotFallback(db: Database.Database, deviceInstanceId: string, sessionId: string): void {
-  const recordId = codeFuseSnapshotRecordId(deviceInstanceId, sessionId)
+/**
+ * The time of the record stored for a session, for an importer that reads
+ * every session on every run and keeps one record per session (Goose, Trae):
+ * the time its id is built from can change after it was first stored. The
+ * importer builds the id from this time with `recordId` (see
+ * `recordIdsForReread`), so it is the id the record is stored under, also
+ * one built from the `'unknown'` sentinel, whose rows `runParse` relabels
+ * before it reads anything.
+ */
+function storedSessionTime(db: Database.Database, tool: Tool, deviceInstanceId: string, sourceFile: string): (sessionId: string) => number | undefined {
+  const stored = db.prepare(`
+    SELECT ts FROM records
+    WHERE tool = ? AND ${LOCAL_RECORDS_WHERE} AND device_instance_id = ? AND source_file = ? AND session_id = ?
+    ORDER BY ts, id LIMIT 1
+  `).pluck()
+  return (sessionId) => stored.get(tool, deviceInstanceId, sourceFile, sessionId) as number | undefined
+}
+
+/**
+ * Record ids for an importer whose read of a row can be incomplete: a Cursor
+ * conversation with a bubble, an OpenCode message with a part, or a Hermes
+ * session with a `tool_calls` payload that cannot be read. Such a read leaves
+ * what is stored as it is (a total that may be short is not stored over a
+ * record, and stored tool calls are kept), but folding a copy stored under
+ * the device id (see `recordIdsForReread`) would not: the original would take
+ * the copy's measurements, and the copy's calls would go with it. `recordId`
+ * returns the parse's id without folding, and `foldCopies` folds the copies of
+ * the records read in full, before they are written. The copy of a record
+ * read in part stays until the record is read in full.
+ */
+function foldOnCompleteRead(recordIds: RereadRecordIds): { recordId: RecordIdBuilder; foldCopies(ids: Iterable<string>): void } {
+  const keys = new Map<string, [string, number]>()
+  return {
+    recordId: (seed, offset) => {
+      const id = recordIds.storedId(seed, offset)
+      keys.set(id, [seed, offset])
+      return id
+    },
+    foldCopies: (ids) => {
+      for (const id of ids) {
+        const key = keys.get(id)
+        if (key) recordIds.recordId(key[0], key[1])
+      }
+    },
+  }
+}
+
+/** The ids of `records` that are not in `incomplete`. */
+function completeRecordIds(records: StatsRecord[], incomplete: string[]): string[] {
+  const skip = new Set(incomplete)
+  return records.map(record => record.id).filter(id => !skip.has(id))
+}
+
+type RecordIds = { deviceInstanceId: string; recordId?: RecordIdBuilder }
+
+function codeFuseSnapshotRecordId(ids: RecordIds, sessionId: string): string {
+  return recordIdFor(ids, `codefuse:snapshot:${sessionId}`, 0)
+}
+
+function deleteCodeFuseSnapshotFallback(db: Database.Database, ids: RecordIds, sessionId: string): void {
+  const recordId = codeFuseSnapshotRecordId(ids, sessionId)
   db.prepare('DELETE FROM tool_calls WHERE record_id = ?').run(recordId)
   db.prepare("DELETE FROM records WHERE id = ? AND tool = 'codefuse'").run(recordId)
 }
@@ -228,6 +346,7 @@ function parseCodeFuseSnapshotFile(options: {
   filePath: string
   device: string
   deviceInstanceId: string
+  recordId?: RecordIdBuilder
   platform?: string
   now: number
   exchangeRate?: number
@@ -254,7 +373,7 @@ function parseCodeFuseSnapshotFile(options: {
     LIMIT 1
   `).get(sessionId)
   if (hasJsonlRecord) {
-    deleteCodeFuseSnapshotFallback(db, deviceInstanceId, sessionId)
+    deleteCodeFuseSnapshotFallback(db, options, sessionId)
     return { records, errors }
   }
 
@@ -283,7 +402,7 @@ function parseCodeFuseSnapshotFile(options: {
   const cost = hasPrice ? calculateCost(model, tokenArgs, exchangeRate) : 0
 
   records.push({
-    id: codeFuseSnapshotRecordId(deviceInstanceId, sessionId),
+    id: codeFuseSnapshotRecordId(options, sessionId),
     ts,
     ingestedAt: now,
     updatedAt: now,
@@ -321,6 +440,7 @@ function parseKiroSessionFile(options: {
   filePath: string
   device: string
   deviceInstanceId: string
+  recordId?: RecordIdBuilder
   platform?: string
   now: number
   exchangeRate?: number
@@ -338,7 +458,7 @@ function parseKiroSessionFile(options: {
 
   // Try workspace-sessions format: history[].promptLogs[]
   if (Array.isArray(parsed?.history) && !parsed?.session_state) {
-    return parseKiroWorkspaceSession({ filePath, parsed, device, deviceInstanceId, platform, now, exchangeRate })
+    return parseKiroWorkspaceSession({ filePath, parsed, device, deviceInstanceId, recordId: options.recordId, platform, now, exchangeRate })
   }
 
   const turns = parsed?.session_state?.conversation_metadata?.user_turn_metadatas
@@ -368,7 +488,7 @@ function parseKiroSessionFile(options: {
     const cost = calculateCost(model, tokenArgs, exchangeRate)
 
     records.push({
-      id: generateRecordId(deviceInstanceId, `${filePath}:${requestId}`, recordTs),
+      id: recordIdFor(options, `${filePath}:${requestId}`, recordTs),
       ts: recordTs,
       ingestedAt: now,
       updatedAt: now,
@@ -399,6 +519,7 @@ function parseKiroWorkspaceSession(options: {
   parsed: any
   device: string
   deviceInstanceId: string
+  recordId?: RecordIdBuilder
   platform?: string
   now: number
   exchangeRate?: number
@@ -471,7 +592,7 @@ function parseKiroWorkspaceSession(options: {
     const sourceId = `${sessionId}:${index}`
 
     records.push({
-      id: generateRecordId(deviceInstanceId, `${filePath}:${sourceId}`, recordTs),
+      id: recordIdFor(options, `${filePath}:${sourceId}`, recordTs),
       ts: recordTs,
       ingestedAt: now,
       updatedAt: now,
@@ -505,8 +626,20 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
   const deviceInstanceId = state?.deviceInstanceId ?? 'unknown'
   const devicePlatform = config?.platform
 
+  // Rows parsed before this installation had a device id carry the 'unknown'
+  // sentinel, and their ids are built from it. They are relabelled before
+  // anything is read, and every record id below is built by
+  // recordIdsForReread, so a record read again is written to the row it is
+  // stored under instead of being stored a second time.
+  backfillUnknownDeviceInstanceId(db, deviceInstanceId, device)
+  const recordIds = recordIdsForReread(db, deviceInstanceId)
+  const recordId = recordIds.recordId
+
   const watermarkPath = join(AIUSAGE_DIR, 'watermark.json')
   const wm = new WatermarkManager(watermarkPath)
+  // Once per database: remove the rows the Kiro, Cursor transcript and
+  // CodeBuddy IDE importers used to add on every change of a source.
+  repairImporterDuplicates(db, wm)
 
   const toolPaths = discoverLogFiles()
   const aggregator = new Aggregator()
@@ -514,6 +647,7 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
   let parsedCount = 0
   let toolCallCount = 0
   const errors: string[] = []
+  const warnings: string[] = []
 
   const onProgress = options?.onProgress ?? (() => {})
 
@@ -538,6 +672,7 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
               dbPath: filePath,
               device,
               deviceInstanceId,
+              recordId,
               platform: devicePlatform,
               now: Date.now(),
               fallbackTs: stat.mtimeMs,
@@ -560,7 +695,18 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
           continue
         }
 
-        if (offset >= stat.size) {
+        // Append-only logs are skipped once the watermark reached EOF. A Kelivo
+        // SQLite database is not append-only: SQLite rewrites pages in place and
+        // appends to its -wal without changing the main file's size, so the
+        // watermark's offset would hide every later message. Those files are
+        // re-read in full instead and deduplicated by record id.
+        // A Kiro token log that changed without growing was replaced; its
+        // branch below notices and reads it from the start. A shorter file
+        // is a replacement whatever its time says (a restored copy keeps it).
+        const kiroLogChanged = tool === 'kiro' && filePath.endsWith('.jsonl') && !!entry
+          && (entry.mtime !== stat.mtimeMs || stat.size < entry.size)
+        const skipUnchangedFile = !(tool === 'kelivo' && isKelivoDatabaseFile(filePath)) && !kiroLogChanged
+        if (skipUnchangedFile && offset >= stat.size) {
           onProgress({ phase: 'Parsing logs', tool, current: toolIndex, total: toolTotal, records: parsedCount, toolCalls: toolCallCount })
           continue // No new data
         }
@@ -571,6 +717,7 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
             tool,
             device,
             deviceInstanceId,
+            recordId,
             platform: devicePlatform,
             now: Date.now(),
             exchangeRate,
@@ -596,6 +743,7 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
             filePath,
             device,
             deviceInstanceId,
+            recordId,
             platform: devicePlatform,
             now: Date.now(),
             exchangeRate,
@@ -620,6 +768,7 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
             filePath,
             device,
             deviceInstanceId,
+            recordId,
             platform: devicePlatform,
             now: Date.now(),
             exchangeRate,
@@ -640,34 +789,42 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
         }
 
         if (tool === 'kiro' && filePath.endsWith('.jsonl')) {
-          const content = readFileSync(filePath, 'utf-8')
-          const lines = content.split('\n')
-          let byteOffset = 0
-          for (const line of lines) {
-            if (!line.trim()) {
-              byteOffset += Buffer.byteLength(line, 'utf-8') + 1
-              continue
-            }
+          const buffer = readFileSync(filePath)
+          // The log is append-only, so the part read last time is still there
+          // byte for byte. If it is not, the file was replaced: read it from
+          // the start.
+          const startOffset = offset > 0 && entry?.headFingerprint !== undefined
+            && entry.headFingerprint === prefixFingerprint(buffer, offset) ? offset : 0
+          const records: StatsRecord[] = []
+          let nextOffset = buffer.length
+          // Lines before the watermark are already stored.
+          for (let lineOffset = startOffset; lineOffset < buffer.length;) {
+            const newline = buffer.indexOf(0x0a, lineOffset)
+            const lineEnd = newline === -1 ? buffer.length : newline
+            const line = buffer.toString('utf-8', lineOffset, lineEnd)
+            const thisOffset = lineOffset
+            lineOffset = lineEnd + 1
+            if (!line.trim()) continue
             try {
               const data = JSON.parse(line)
               const inputTokens = toNumber(data.promptTokens ?? data.inputTokens ?? data.tokensIn)
               const outputTokens = toNumber(data.generatedTokens ?? data.outputTokens ?? data.tokensOut)
-              if (inputTokens + outputTokens === 0) {
-                byteOffset += Buffer.byteLength(line, 'utf-8') + 1
-                continue
-              }
+              if (inputTokens + outputTokens === 0) continue
               const model = normalizeKiroModel(data.model)
               const provider = typeof data.provider === 'string' && data.provider.trim() ? data.provider.trim().toLowerCase() : inferProvider(model)
-              const recordTs = stat.mtimeMs
+              // The time of the request when the line records one; otherwise the
+              // file time, which is close to it now that a line is read only once.
+              const lineTs = parseTimestamp(data.timestamp ?? data.ts ?? data.time ?? data.createdAt, 0)
+              const recordTs = lineTs > 0 ? lineTs : stat.mtimeMs
               const tokenArgs = { inputTokens, outputTokens, cacheReadTokens: 0, cacheWriteTokens: 0, thinkingTokens: 0 }
               const cost = calculateCost(model, tokenArgs, exchangeRate)
-              const recordId = generateRecordId(deviceInstanceId, `${filePath}:${byteOffset}`, recordTs)
               const record: StatsRecord = {
-                id: recordId,
+                // No time in the id: reading a line again replaces its record.
+                id: kiroLogLineId({ deviceInstanceId, recordId }, filePath, thisOffset, line),
                 ts: recordTs,
                 ingestedAt: Date.now(),
                 updatedAt: Date.now(),
-                lineOffset: byteOffset,
+                lineOffset: thisOffset,
                 tool: 'kiro',
                 model,
                 provider,
@@ -684,35 +841,53 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
                 deviceInstanceId,
                 platform: devicePlatform,
               }
-              insertRecord(db, record)
-              parsedCount++
-            } catch {}
-            byteOffset += Buffer.byteLength(line, 'utf-8') + 1
+              records.push(record)
+            } catch {
+              // A last line without a newline that does not parse is still
+              // being written: leave it for the next parse.
+              if (newline === -1) nextOffset = thisOffset
+            }
           }
+          // Each line also replaces the copies the old, time-based ids left of it.
+          replaceKiroLogLines(db, filePath, records)
+          parsedCount += records.length
           wm.setEntry(tool, filePath, {
-            offset: stat.size,
+            offset: nextOffset,
             size: stat.size,
             mtime: stat.mtimeMs,
+            headFingerprint: prefixFingerprint(buffer, nextOffset) ?? undefined,
           })
           wm.save()
           onProgress({ phase: 'Parsing logs', tool, current: toolIndex, total: toolTotal, records: parsedCount, toolCalls: toolCallCount })
           continue
         }
 
-        if (tool === 'kelivo' && (filePath.endsWith('chats.json') || filePath.endsWith('.zip'))) {
+        if (tool === 'kelivo' && isKelivoSourceFile(filePath)) {
           const result = await runParseKelivo({
             filePath,
             device,
             deviceInstanceId,
+            recordId,
             platform: devicePlatform,
             now: Date.now(),
             exchangeRate,
           })
-          for (const record of result.records) {
-            insertRecord(db, record)
-            parsedCount++
+          if (isKelivoDatabaseFile(filePath)) {
+            // A discovered live database is scanned repeatedly. Only changed
+            // rows count as newly parsed, and unchanged rows stay untouched.
+            parsedCount += insertChangedRecords(db, result.records)
+          } else {
+            // A backup selected again is still a user-visible import. Keep the
+            // record version and sync state, but advance its import timestamp.
+            const stampImport = db.prepare('UPDATE records SET ingested_at = ? WHERE id = ?')
+            for (const record of result.records) {
+              insertRecord(db, record)
+              stampImport.run(record.ingestedAt, record.id)
+              parsedCount++
+            }
           }
           errors.push(...result.errors)
+          warnings.push(...result.warnings)
           wm.setEntry(tool, filePath, {
             offset: stat.size,
             size: stat.size,
@@ -725,21 +900,27 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
 
         // Cursor agent-transcript JSONL (fallback for PRIVACY_MODE_NO_STORAGE)
         if (tool === 'cursor' && filePath.endsWith('.jsonl') && filePath.includes('agent-transcripts')) {
-          const est = runParseCursorTranscript({
+          // The transcript is an estimate for conversations state.vscdb has no
+          // token counts for. One that is counted from there is not estimated
+          // as well, and an estimate stored for it earlier is dropped.
+          const countedFromDatabase = hasCursorDatabaseRecord(db, cursorTranscriptComposerId(filePath))
+          const est = countedFromDatabase ? { inputTextChars: 0, outputTextChars: 0 } : runParseCursorTranscript({
             jsonlPath: filePath,
             device,
             deviceInstanceId,
             platform: devicePlatform,
             now: Date.now(),
           })
-          if (est.inputTextChars + est.outputTextChars > 0) {
+          if (countedFromDatabase) {
+            replaceSourceRecords(db, 'cursor', filePath, [])
+          } else if (est.inputTextChars + est.outputTextChars > 0) {
             const sessionId = filePath.split('/').slice(-2, -1)[0] || 'unknown'
             const recordTs = stat.mtimeMs
             const tokenArgs = { inputTokens: est.inputTextChars, outputTokens: est.outputTextChars, cacheReadTokens: 0, cacheWriteTokens: 0, thinkingTokens: 0 }
             const cost = calculateCost('cursor-composer', tokenArgs, exchangeRate)
-            const recordId = generateRecordId(deviceInstanceId, filePath, recordTs)
             const record: StatsRecord = {
-              id: recordId,
+              // The file alone: one record per transcript, replaced when it grows.
+              id: recordId(filePath, 0),
               ts: recordTs,
               ingestedAt: Date.now(),
               updatedAt: Date.now(),
@@ -760,8 +941,11 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
               deviceInstanceId,
               platform: devicePlatform,
             }
-            insertRecord(db, record)
-            parsedCount++
+            // Also removes the estimates stored under the old, time-based ids.
+            // A transcript only grows: an estimate with less input or less
+            // output than the stored one means part of the file could not be
+            // parsed, and is not stored.
+            if (replaceSourceSnapshot(db, 'cursor', filePath, record, 'larger')) parsedCount++
           }
           wm.setEntry(tool, filePath, {
             offset: stat.size,
@@ -788,9 +972,25 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
         const sessionId = tool === 'codefuse' && typeof firstData?.sessionId === 'string' && firstData.sessionId
           ? firstData.sessionId
           : extractSessionId(filePath, tool)
-        if (tool === 'codefuse' && filePath.endsWith('.jsonl')) {
-          deleteCodeFuseSnapshotFallback(db, deviceInstanceId, sessionId)
-        }
+
+        // Written once the whole file is read, one write per record id. Claude
+        // Code logs one line per content block of a message and every line
+        // yields the message's record again, each time with that line's
+        // offset, timestamp and running usage; the last line holds the final
+        // values. Writing only that one means a file that is read again
+        // compares final state against final state, so an unchanged record
+        // keeps its updated_at and stays synced.
+        const pendingRecords = new Map<string, StatsRecord>()
+        const pendingToolCalls: Array<{ tc: ToolCallRecord; lineOffset: number }> = []
+        // A Claude Code log read from its start writes all of its tool calls
+        // again under block-keyed ids, so the row an earlier release stored
+        // for each of those calls under a positional id is removed with it.
+        // This is the cleanup half of the one-time re-import (the watermark's
+        // claudeCodeParserVersion gate resets every file to offset 0). It is
+        // tied to the calls a file actually yields rather than to that gate,
+        // so calls that cannot be read again (their log is gone) are kept,
+        // and a re-import that was interrupted finishes file by file.
+        const replacesPositionalToolCalls = tool === 'claude-code' && offset === 0
 
         for (const line of lines) {
           if (!line.trim()) {
@@ -808,6 +1008,7 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
               sessionId,
               device,
               deviceInstanceId,
+              recordId,
               platform: devicePlatform,
               exchangeRate,
             }))
@@ -822,6 +1023,7 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
             sessionId,
             device,
             deviceInstanceId,
+            recordId,
             platform: devicePlatform,
             exchangeRate,
           })
@@ -829,18 +1031,64 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
           const result = aggregator.parseLine(line, context)
           if (result) {
             if (result.record) {
-              insertRecord(db, result.record)
+              pendingRecords.set(result.record.id, result.record)
               parsedCount++
             }
 
             for (const tc of result.toolCalls) {
-              insertToolCall(db, tc)
+              pendingToolCalls.push({ tc, lineOffset: byteOffset })
               toolCallCount++
             }
           }
 
           byteOffset += Buffer.byteLength(line, 'utf-8') + 1
         }
+
+        // One transaction: a positional row is deleted only together with
+        // the insert of the row that replaces it, and a CodeFuse snapshot
+        // record only together with the records of the log that replaces it.
+        db.transaction(() => {
+          if (tool === 'codefuse' && filePath.endsWith('.jsonl')) {
+            deleteCodeFuseSnapshotFallback(db, { deviceInstanceId, recordId }, sessionId)
+          }
+          // Where each record was stored under this file before this pass.
+          const storedLines = new Map<string, number>()
+          const storedLine = db.prepare('SELECT line_offset FROM records WHERE id = ? AND source_file = ?')
+          for (const pending of pendingRecords.values()) {
+            if (replacesPositionalToolCalls) {
+              const stored = storedLine.get(pending.id, filePath) as { line_offset: number } | undefined
+              if (stored) storedLines.set(pending.id, stored.line_offset)
+            }
+            const record = tool === 'claude-code' ? resolveClaudeCodeRecord(db, pending, filePath) : pending
+            if (!record) continue
+            // The cwd is part of the row as it is written, so a record this
+            // pass changes gets its new updated_at from insertRecord alone;
+            // the UPDATE below only reaches rows this pass did not write.
+            // A record stored under another transcript keeps that file's cwd.
+            insertRecord(db, fileCwd && !record.cwd && record.sourceFile === filePath ? { ...record, cwd: fileCwd } : record)
+          }
+          const toolCallExists = db.prepare('SELECT 1 FROM tool_calls WHERE id = ?')
+          for (const { tc, lineOffset } of pendingToolCalls) {
+            if (replacesPositionalToolCalls) {
+              // An earlier release kept only the calls of the line its record
+              // was last written from, so an old row under another name (see
+              // deletePositionalCounterpart) is this call only when the record
+              // is still stored at this very line by such a release. Once
+              // this release has written the record from a line, that line's
+              // calls are stored under their block-keyed ids, and any old row
+              // still there was kept from somewhere else. That holds for this
+              // block wherever it was written from: a block already stored
+              // under its block-keyed id replaces nothing, so a log read in
+              // full again (a later one-time re-import) leaves alone an old
+              // row of another block with the same name, timestamp and index.
+              const storedByBlock = toolCallExists.get(tc.id) !== undefined
+              const fromStoredLine = storedLines.get(tc.recordId!) === lineOffset && !storedByBlock
+              if (!storedByBlock) deletePositionalCounterpart(db, tc, fromStoredLine)
+            }
+            if (tc.recordId) deleteAdoptedToolCall(db, tc, recordIds.copyOf(tc.recordId), filePath, lineOffset)
+            insertToolCall(db, tc)
+          }
+        })()
 
         // Handle finalize (orphan tool calls for Codex, deduped fallback records for Copilot OTEL, etc.)
         const orphanResults = aggregator.finalize()
@@ -870,6 +1118,10 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
         onProgress({ phase: 'Parsing logs', tool, current: toolIndex, total: toolTotal, records: parsedCount, toolCalls: toolCallCount })
       } catch (e) {
         errors.push(`${filePath}: ${e instanceof Error ? e.message : e}`)
+        // The pass did not reach finalize(), so the parsers may still hold
+        // state of this file (a Codex function call waiting for its usage
+        // line). Drop it so it is not attached to the next file.
+        try { aggregator.finalize() } catch {}
       }
     }
   }
@@ -880,24 +1132,26 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
     try {
       const openCodeDb = new Database(openCodeDbPath, { readonly: true })
       try {
+        const ids = foldOnCompleteRead(recordIds)
         const result = runParseOpenCode(openCodeDb, {
           dbPath: openCodeDbPath,
           device,
           deviceInstanceId,
+          recordId: ids.recordId,
           platform: devicePlatform,
           now: Date.now(),
           cursor: wm.getOpenCodeCursor(),
           exchangeRate,
         })
 
-        for (const record of result.records) insertRecord(db, record)
-        for (const tc of result.toolCalls) insertToolCall(db, tc)
+        ids.foldCopies(completeRecordIds(result.records, result.incompleteToolCallRecordIds))
+        const stored = insertRecordsWithToolCalls(db, result.records, result.toolCalls, result.incompleteToolCallRecordIds)
         if (result.nextCursor) {
           wm.setOpenCodeCursor(result.nextCursor)
           wm.save()
         }
-        parsedCount += result.records.length
-        toolCallCount += result.toolCalls.length
+        parsedCount += stored.records
+        toolCallCount += stored.toolCalls
         errors.push(...result.errors)
         onProgress({ phase: 'Parsing SQLite', tool: 'opencode', current: 1, total: 1, records: parsedCount, toolCalls: toolCallCount })
       } finally {
@@ -914,24 +1168,26 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
     try {
       const hermesDb = new Database(hermesDbPath, { readonly: true })
       try {
+        const ids = foldOnCompleteRead(recordIds)
         const result = runParseHermes(hermesDb, {
           dbPath: hermesDbPath,
           device,
           deviceInstanceId,
+          recordId: ids.recordId,
           platform: devicePlatform,
           now: Date.now(),
           cursor: wm.getHermesCursor(),
           exchangeRate,
         })
 
-        for (const record of result.records) insertRecord(db, record)
-        for (const tc of result.toolCalls) insertToolCall(db, tc)
+        ids.foldCopies(completeRecordIds(result.records, result.incompleteToolCallRecordIds))
+        const stored = insertRecordsWithToolCalls(db, result.records, result.toolCalls, result.incompleteToolCallRecordIds)
         if (result.nextCursor) {
           wm.setHermesCursor(result.nextCursor)
           wm.save()
         }
-        parsedCount += result.records.length
-        toolCallCount += result.toolCalls.length
+        parsedCount += stored.records
+        toolCallCount += stored.toolCalls
         errors.push(...result.errors)
         onProgress({ phase: 'Parsing SQLite', tool: 'hermes', current: 1, total: 1, records: parsedCount, toolCalls: toolCallCount })
       } finally {
@@ -952,6 +1208,7 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
           dbPath: qoderDbPath,
           device,
           deviceInstanceId,
+          recordId,
           platform: devicePlatform,
           now: Date.now(),
           cursor: wm.getQoderCursor(),
@@ -983,10 +1240,12 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
       const cursorDb = new Database(cursorDbPath, { readonly: true })
       try {
         let cursorProgressFired = false
+        const ids = foldOnCompleteRead(recordIds)
         const result = runParseCursor(cursorDb, {
           dbPath: cursorDbPath,
           device,
           deviceInstanceId,
+          recordId: ids.recordId,
           platform: devicePlatform,
           now: Date.now(),
           cursor: wm.getCursorCursor(),
@@ -996,13 +1255,22 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
           },
         })
 
-        for (const record of result.records) insertRecord(db, record)
+        // A total that may be short never replaces a stored one: neither
+        // itself, nor through the copy of its record (see foldOnCompleteRead).
+        ids.foldCopies(result.records.map(record => record.id))
+        const hasRecord = db.prepare('SELECT 1 FROM records WHERE id = ?')
+        const partialRecords = result.partialRecords.filter((record) => !hasRecord.get(record.id))
+        // Every conversation is read on every run: only the records that are
+        // new or changed are written and counted.
+        parsedCount += insertChangedRecords(db, [...result.records, ...partialRecords])
         for (const tc of result.toolCalls) insertToolCall(db, tc)
+        // Transcripts are read before this database: an estimate stored for a
+        // conversation that now has real token counts is superseded.
+        deleteCursorTranscriptEstimates(db, result.records.map((record) => record.sessionId))
         if (result.nextCursor) {
           wm.setCursorCursor(result.nextCursor)
           wm.save()
         }
-        parsedCount += result.records.length
         toolCallCount += result.toolCalls.length
         errors.push(...result.errors)
         if (!cursorProgressFired) {
@@ -1026,18 +1294,20 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
           dbPath: kiloDbPath,
           device,
           deviceInstanceId,
+          recordId,
           platform: devicePlatform,
           now: Date.now(),
-          cursor: wm.getOpenCodeCursor(),
+          cursor: wm.getKiloCursor(),
           exchangeRate,
         })
 
-        for (const record of result.records) insertRecord(db, record)
+        // Messages kept pending are read again: only new or changed records
+        // are written and counted.
+        parsedCount += insertChangedRecords(db, result.records)
         if (result.nextCursor) {
-          wm.setOpenCodeCursor(result.nextCursor)
+          wm.setKiloCursor(result.nextCursor)
           wm.save()
         }
-        parsedCount += result.records.length
 
         // 输出KiloCode统计信息
         if (result.records.length > 0) {
@@ -1072,17 +1342,24 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
           dbPath: gooseDbPath,
           device,
           deviceInstanceId,
+          recordId,
           platform: devicePlatform,
           now: Date.now(),
           cursor: wm.getGooseCursor(),
           exchangeRate,
+          // A session is found again by its session id and keeps the time,
+          // and so the id, it was first stored under: both are built from its
+          // creation time, or from the time of the import when that cannot be
+          // read.
+          storedTime: storedSessionTime(db, 'goose', deviceInstanceId, gooseDbPath),
         })
-        for (const record of result.records) insertRecord(db, record)
+        // Every session is read on every run: only the records that are new
+        // or changed are written and counted.
+        parsedCount += insertChangedRecords(db, result.records)
         if (result.nextCursor) {
           wm.setGooseCursor(result.nextCursor)
           wm.save()
         }
-        parsedCount += result.records.length
         errors.push(...result.errors)
         onProgress({ phase: 'Parsing SQLite', tool: 'goose', current: 1, total: 1, records: parsedCount, toolCalls: toolCallCount })
       } finally {
@@ -1103,6 +1380,7 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
           dbPath: kiroDbPath,
           device,
           deviceInstanceId,
+          recordId,
           platform: devicePlatform,
           now: Date.now(),
           cursor: wm.getKiroCursor(),
@@ -1134,6 +1412,7 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
           dbPath: zedDbPath,
           device,
           deviceInstanceId,
+          recordId,
           platform: devicePlatform,
           now: Date.now(),
           cursor: wm.getZedCursor(),
@@ -1166,6 +1445,7 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
             dbPath: zcodeDbPath,
             device,
             deviceInstanceId,
+            recordId,
             platform: devicePlatform,
             now: Date.now(),
             cursor: wm.getZcodeCursor(),
@@ -1206,14 +1486,25 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
       dbPath: traeDbPath,
       device,
       deviceInstanceId,
+      recordId,
       platform: devicePlatform,
       now: Date.now(),
       lastImportedAt: traeLastImported,
+      // As for Goose: a session keeps the time, and so the id, it was first
+      // stored under.
+      storedTime: storedSessionTime(db, 'trae', deviceInstanceId, traeDbPath),
     })
-    for (const record of result.records) insertRecord(db, record)
-    for (const tc of result.toolCalls) insertToolCall(db, tc)
-    parsedCount += result.records.length
-    toolCallCount += result.toolCalls.length
+    // Every session is emitted on every run: only the records that are new
+    // or changed are written and counted. A Trae tool call's id is built
+    // from everything stored for it, so one that is stored already is left
+    // as it is.
+    parsedCount += insertChangedRecords(db, result.records)
+    const hasToolCall = db.prepare('SELECT 1 FROM tool_calls WHERE id = ?')
+    for (const tc of result.toolCalls) {
+      if (hasToolCall.get(tc.id)) continue
+      insertToolCall(db, tc)
+      toolCallCount++
+    }
     errors.push(...result.errors)
     if (result.lastImportedAt > traeLastImported) {
       wm.setTraeLastImported?.(result.lastImportedAt)
@@ -1231,13 +1522,18 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
         dataDir: codeBuddyIdeDir,
         device,
         deviceInstanceId,
+        recordId,
         platform: devicePlatform,
         now: Date.now(),
         cursor: cbCursor,
         exchangeRate,
       })
-      for (const record of result.records) insertRecord(db, record)
-      parsedCount += result.records.length
+      // One record per conversation: a conversation imported again replaces
+      // its record, including one stored under the old, time-based id, unless
+      // what is stored is newer than what could be read.
+      for (const record of result.records) {
+        if (replaceSourceSnapshot(db, 'codebuddy', record.sourceFile, record, 'later')) parsedCount++
+      }
       errors.push(...result.errors)
       if (result.nextCursor > cbCursor) {
         wm.setCodeBuddyIdeCursor(result.nextCursor)
@@ -1248,10 +1544,6 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
       errors.push(`${codeBuddyIdeDir}: ${e instanceof Error ? e.message : e}`)
     }
   }
-
-  // Fix historical records that were parsed before init created state.json.
-  // If the current device UUID is known, backfill any records with 'unknown' device_instance_id.
-  backfillUnknownDeviceInstanceId(db, deviceInstanceId, device)
 
   // Backfill platform for existing records that have an empty platform field.
   if (devicePlatform) {
@@ -1284,7 +1576,7 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
     wm.save()
   }
 
-  return { parsedCount, toolCallCount, errors }
+  return { parsedCount, toolCallCount, errors, warnings }
 }
 
 /**
@@ -1362,21 +1654,68 @@ export function backfillHermesSourceFiles(db: Database.Database): void {
   }
 }
 
+/**
+ * Decide what one pass over a Claude Code log writes for a message's record.
+ *
+ * Claude Code can copy a message into a second transcript (a resumed
+ * session), so the same record id can come from two files, and either file
+ * may hold more of the message's lines than the other. Each line carries its
+ * own timestamp and the usage so far, so the state of a message is ordered by
+ * timestamp and, between lines on one timestamp, by output tokens.
+ *
+ * - A pass never replaces the stored state with an earlier one.
+ * - While the file the record is stored under still exists, the record stays
+ *   with it: `source_file` and `line_offset` form the record's sync wire id,
+ *   and `session_id` its session. Letting each file claim the record in turn
+ *   would rewrite it twice on every re-import and queue an unchanged record
+ *   for upload. Another file's copy contributes only its content, when it
+ *   holds a later state, or the same state as the stored one: the same
+ *   model and usage, whose derived fields (the cost under current prices)
+ *   insertRecord then writes only if they differ.
+ *
+ * Returns the record to write, or null when nothing is to be written.
+ */
+function resolveClaudeCodeRecord(db: Database.Database, record: StatsRecord, filePath: string): StatsRecord | null {
+  const stored = db.prepare(
+    'SELECT ts, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, thinking_tokens, source_file, line_offset, session_id FROM records WHERE id = ?'
+  ).get(record.id) as { ts: number; model: string; input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_write_tokens: number; thinking_tokens: number; source_file: string; line_offset: number; session_id: string } | undefined
+  if (!stored) return record
+  const order = record.ts !== stored.ts ? record.ts - stored.ts : record.outputTokens - stored.output_tokens
+  if (order < 0) return null
+  if (stored.source_file === filePath || !existsSync(stored.source_file)) return record
+  // On equal order only the stored state itself is written again; a line
+  // that differs from it in what it reports is neither earlier nor later.
+  if (order === 0 && (record.model !== stored.model || record.inputTokens !== stored.input_tokens
+    || record.cacheReadTokens !== stored.cache_read_tokens || record.cacheWriteTokens !== stored.cache_write_tokens
+    || record.thinkingTokens !== stored.thinking_tokens)) return null
+  return { ...record, sourceFile: stored.source_file, lineOffset: stored.line_offset, sessionId: stored.session_id }
+}
+
 function backfillSkillNames(db: Database.Database): void {
   const rows = db.prepare(`
-    SELECT tc.id, tc.record_id, tc.ts, tc.call_index,
-           r.source_file, r.line_offset
+    SELECT tc.id, tc.record_id, tc.name, tc.ts, tc.call_index,
+           r.tool, r.source_file, r.line_offset
     FROM tool_calls tc
     JOIN records r ON r.id = tc.record_id
     WHERE (tc.name = 'Skill' OR tc.name = 'skill__unknown')
       AND r.${LOCAL_RECORDS_WHERE}
-  `).all() as { id: string; record_id: string; ts: number; call_index: number; source_file: string; line_offset: number }[]
+  `).all() as { id: string; record_id: string; name: string; ts: number; call_index: number; tool: Tool; source_file: string; line_offset: number }[]
 
   if (rows.length === 0) return
 
   const updateStmt = db.prepare('UPDATE tool_calls SET id = ?, name = ? WHERE id = ?')
+  const toolCallExists = db.prepare('SELECT 1 FROM tool_calls WHERE id = ?')
 
   for (const row of rows) {
+    // The parser no longer writes a Claude Code call under a positional id,
+    // so a row that is not under one was named by the current parser from
+    // its own block: there is nothing to backfill, and the lookup below does
+    // not apply to it. It finds a block by call_index in the record's line,
+    // which is the last line of the message and not necessarily the line the
+    // call came from, and it would move the row to a positional id. Rows
+    // still under a positional id were written by an earlier release, always
+    // from that last line.
+    if (row.tool === 'claude-code' && !hasPositionalToolCallId(row)) continue
     try {
       const fd = openSync(row.source_file, 'r')
       const buf = Buffer.alloc(65536)
@@ -1390,11 +1729,32 @@ function backfillSkillNames(db: Database.Database): void {
       const parsed = JSON.parse(line)
       if (!Array.isArray(parsed.message?.content)) continue
 
+      if (row.tool === 'claude-code') {
+        // An earlier release stored the call of the last line of its message,
+        // which is the line read here, unless the record has since moved: a
+        // call kept from a transcript that is gone stays with its record when
+        // another transcript takes the record over. Only a row that carries
+        // this line's timestamp is matched against this line's blocks, and
+        // (below) only a block that is not stored yet.
+        const rawTs = parsed.message.timestamp ?? parsed.timestamp
+        const lineTs = typeof rawTs === 'number' ? rawTs : new Date(rawTs).getTime()
+        if (lineTs !== row.ts) continue
+      }
+
       let callIndex = 0
       let skillArg = ''
+      let alreadyStored = false
       for (const block of parsed.message.content) {
         if (block.type !== 'tool_use') continue
         if (callIndex === row.call_index) {
+          if (row.tool === 'claude-code') {
+            // A timestamp and an index do not identify a block: another
+            // block of the message can share both. When this release has
+            // read the line, the block found here is stored under its own
+            // id, and the row is a different call that was kept beside it.
+            const current = claudeCodeToolCall(block, row.record_id, row.ts, row.call_index)
+            alreadyStored = current !== null && toolCallExists.get(current.id) !== undefined
+          }
           if (block.name === 'Skill') {
             const raw = block.input?.skill ?? block.input?.skillName ?? block.input?.name ?? ''
             skillArg = typeof raw === 'string' ? raw.trim() : ''
@@ -1403,6 +1763,7 @@ function backfillSkillNames(db: Database.Database): void {
         }
         callIndex++
       }
+      if (alreadyStored) continue
 
       const storedName = skillArg ? `skill__${skillArg}` : 'skill__unknown'
       const newId = generateToolCallId(row.record_id, storedName, row.ts, row.call_index)

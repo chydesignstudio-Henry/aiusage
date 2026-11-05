@@ -4,8 +4,12 @@ import { hostname, platform, tmpdir } from 'node:os'
 import { randomBytes } from 'node:crypto'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import type Database from 'better-sqlite3'
-import { calculateCostForPrice, removePriceOverride, inferProvider, normalizeQoderModel, resolveExchangeRate, fetchExchangeRate, TOOLS, type PriceEntry } from '@aiusage/core'
-import { AIUSAGE_DIR, buildConsentConfig, loadConfig, saveConfig } from '../config.js'
+import { removePriceOverride, resolveExchangeRate, fetchExchangeRate, TOOLS, type PriceEntry } from '@aiusage/core'
+import { AIUSAGE_DIR, buildConsentConfig, loadConfig, saveConfig, updateConfig } from '../config.js'
+import { withSettingsLock } from '../settings-lock.js'
+import { JsonFileError } from '../json-file.js'
+import { GitHubAuthError } from '../github/errors.js'
+import { deleteGitHubCredentials, saveGitHubCredentials } from '../github/credentials.js'
 import { browserProtocol, isTrustedApiRequest } from './trust.js'
 import { credentialStatus, publicSyncConfig, setSyncCredentials } from './credential-settings.js'
 import { createGitHubDeviceSessions } from '../github/device-sessions.js'
@@ -30,11 +34,12 @@ import { getSiteUrl } from '../site-url.js'
 import { startDeviceAuth, completeDeviceAuth, fetchLeaderboardStatus } from '../leaderboard/api.js'
 import { clearCredentials, hasCredentials, loadCredentials, saveCredentials } from '../leaderboard/credentials.js'
 import { base64url, sha256Buffer } from '../leaderboard/crypto.js'
-import { uploadLeaderboardData } from '../commands/leaderboard-upload.js'
-import { runParseKelivo } from '../commands/parse-kelivo.js'
-import { insertRecord, LOCAL_RECORDS_WHERE } from '../db/records.js'
+import { recordLeaderboardUpload, uploadLeaderboardData } from '../commands/leaderboard-upload.js'
+import { isKelivoSourceFile, runParseKelivo } from '../commands/parse-kelivo.js'
+import { recalcPricing } from '../commands/recalc.js'
+import { insertChangedRecords, LOCAL_RECORDS_WHERE, recordIdsForReread } from '../db/records.js'
 import { AsyncTaskQueue, type AsyncTaskQueueStatus } from '../db/write-queue.js'
-import { getPricingRegistrySummary, getUserAliasBindings, hasUserPrice, listLocalModelBindings, listPricingAliasTargets, listPricingModels, loadPricingRuntime, removeUserPricingAlias, resetUserPriceToSynced, resolvePriceFromRegistry, setUserPrice, setUserPricingAlias, syncPricingFromLitellm } from '../pricing-registry.js'
+import { getPricingRegistrySummary, getUserAliasBindings, listLocalModelBindings, listPricingAliasTargets, listPricingModels, loadPricingRuntime, removeUserPricingAlias, resetUserPriceToSynced, setUserPrice, setUserPricingAlias, syncPricingFromLitellm } from '../pricing-registry.js'
 import type { DetectedTool } from '../discovery.js'
 
 const pendingLeaderboardAuth = new Map<string, { verifier: string; expiresAt: number }>()
@@ -110,69 +115,6 @@ function emptyPricingRecalcStatus(): PricingRecalcStatus {
   }
 }
 
-async function recalcCosts(db: Database.Database, onProgress?: (status: Pick<PricingRecalcStatus, 'total' | 'processed' | 'updated' | 'skipped'>) => void): Promise<number> {
-  const BATCH_SIZE = 1000
-  let updated = 0
-  let processed = 0
-  let skipped = 0
-  let lastId = ''
-  const exchangeRate = resolveExchangeRate(loadConfig() ?? {})
-  const priceCache = new Map<string, PriceEntry | null>()
-  const resolveCachedPrice = (model: string): PriceEntry | undefined => {
-    if (priceCache.has(model)) return priceCache.get(model) ?? undefined
-    const price = resolvePriceFromRegistry(db, model) ?? null
-    priceCache.set(model, price)
-    return price ?? undefined
-  }
-  const totalRow = db.prepare('SELECT COUNT(*) AS total FROM records').get() as { total: number }
-  const total = totalRow.total
-  onProgress?.({ total, processed, updated, skipped })
-
-  while (true) {
-    const records = db.prepare(
-      'SELECT id, tool, model, provider, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, thinking_tokens, cost, cost_source FROM records WHERE id > ? ORDER BY id LIMIT ?'
-    ).all(lastId, BATCH_SIZE) as any[]
-    if (records.length === 0) break
-    const updateStmt = db.prepare('UPDATE records SET model = ?, provider = ?, cost = ?, cost_source = ?, updated_at = ? WHERE id = ?')
-    const tx = db.transaction((batch: any[]) => {
-      for (const r of batch) {
-        processed++
-
-        const rawModel = r.tool === 'qoder' ? normalizeQoderModel(r.model) : r.model
-        const model = rawModel === 'unknown' ? (r.tool === 'qoder' ? 'qoder-auto' : r.model) : rawModel
-
-        // Logged costs are authoritative and left untouched — EXCEPT when the logged
-        // cost is non-positive (custom gateways report 0 for models they don't price)
-        // or when the user has set a manual price for this model. In both cases the
-        // logged value must not block pricing/recalc (issue #13).
-        if (r.cost_source === 'log' && r.cost > 0 && !hasUserPrice(db, model)) {
-          skipped++
-          continue
-        }
-        const provider = model !== r.model ? inferProvider(model) : r.provider
-        const price = resolveCachedPrice(model)
-        const cost = price ? calculateCostForPrice(price, {
-          inputTokens: r.input_tokens,
-          outputTokens: r.output_tokens,
-          cacheReadTokens: r.cache_read_tokens,
-          cacheWriteTokens: r.cache_write_tokens,
-          thinkingTokens: r.thinking_tokens,
-        }, exchangeRate) : 0
-        const costSource = price ? 'pricing' : 'unknown'
-
-        if (model === r.model && provider === r.provider && cost === r.cost && costSource === r.cost_source) continue
-        updateStmt.run(model, provider, cost, costSource, Date.now(), r.id)
-        updated++
-      }
-    })
-    tx(records)
-    lastId = records[records.length - 1].id
-    onProgress?.({ total, processed, updated, skipped })
-    await new Promise<void>((resolve) => setImmediate(resolve))
-  }
-  return updated
-}
-
 /** Calendar components of a YYYY-MM-DD string (falls back to Date parsing for other formats). */
 function parseCalendarDate(value: string): { year: number; month: number; day: number } {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
@@ -209,9 +151,12 @@ function registerLocalDayFunction(db: Database.Database): void {
   })
 }
 
-function getDateRangeFilter(range: string | null, from: string | null, to: string | null, prefix = '', weekStart: 0 | 1 = 1): { where: string; params: Record<string, unknown> } {
-  const ts = prefix ? `${prefix}.ts` : 'ts'
-
+/**
+ * Bounds of a date range in ms since epoch: `start` inclusive, `end` exclusive.
+ * A missing bound leaves that side open. The CLI's `summary` and `export` date
+ * options use it too, so they count the same local days as the dashboard.
+ */
+export function getDateRangeBounds(range: string | null, from: string | null, to: string | null, weekStart: 0 | 1 = 1): { start?: number; end?: number } {
   if (from && to) {
     // Custom ranges come from a date picker as local calendar dates (YYYY-MM-DD).
     // Preset ranges use local-time boundaries, so custom ranges must too: start at
@@ -222,7 +167,7 @@ function getDateRangeFilter(range: string | null, from: string | null, to: strin
     // 01:00, and adding a day to that would leak an hour of the following day into the range.
     const startMs = localMidnightMs(parseCalendarDate(from))
     const endMs = localMidnightMs(parseCalendarDate(to), 1)
-    return { where: `AND ${ts} >= @start AND ${ts} < @end`, params: { start: startMs, end: endMs } }
+    return { start: startMs, end: endMs }
   }
 
   const now = new Date()
@@ -233,22 +178,30 @@ function getDateRangeFilter(range: string | null, from: string | null, to: strin
     const diff = (dayOfWeek - weekStart + 7) % 7
     const startOfWeek = new Date(today)
     startOfWeek.setDate(today.getDate() - diff)
-    return { where: `AND ${ts} >= @start`, params: { start: startOfWeek.getTime() } }
+    return { start: startOfWeek.getTime() }
   }
   if (range === 'month') {
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1)
-    return { where: `AND ${ts} >= @start`, params: { start: startOfMonth.getTime() } }
+    return { start: startOfMonth.getTime() }
   }
   if (range === 'last30') {
     const start = new Date(today)
     start.setDate(start.getDate() - 30)
-    return { where: `AND ${ts} >= @start`, params: { start: start.getTime() } }
+    return { start: start.getTime() }
   }
   if (range === 'all') {
-    return { where: '', params: {} }
+    return {}
   }
   // default: day
-  return { where: `AND ${ts} >= @start`, params: { start: today.getTime() } }
+  return { start: today.getTime() }
+}
+
+function getDateRangeFilter(range: string | null, from: string | null, to: string | null, prefix = '', weekStart: 0 | 1 = 1): { where: string; params: Record<string, unknown> } {
+  const ts = prefix ? `${prefix}.ts` : 'ts'
+  const { start, end } = getDateRangeBounds(range, from, to, weekStart)
+  if (start === undefined) return { where: '', params: {} }
+  if (end === undefined) return { where: `AND ${ts} >= @start`, params: { start } }
+  return { where: `AND ${ts} >= @start AND ${ts} < @end`, params: { start, end } }
 }
 
 const REDACT_PATHS = Symbol('aiusage.redactPaths')
@@ -321,7 +274,7 @@ async function readMultipartFile(req: http.IncomingMessage): Promise<{ filename:
 }
 
 function isKelivoBackupFilename(filename: string): boolean {
-  return filename === 'chats.json' || filename.toLowerCase().endsWith('.zip')
+  return isKelivoSourceFile(filename)
 }
 
 function getDeviceName(): string {
@@ -404,6 +357,7 @@ export interface ApiServerOptions {
   onSyncStart?: () => SyncStartResult
   getSyncStatus?: () => SyncStatusSnapshot | null
   onConfigUpdated?: () => void
+  onLeaderboardUploaded?: (uploadedAt: number) => void
   runDbWrite?: <T>(task: () => T | Promise<T>) => Promise<T>
   getDbWriteQueueStatus?: () => AsyncTaskQueueStatus
 }
@@ -676,12 +630,19 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
         startedAt: pricingRecalcStatus.startedAt ?? Date.now(),
       }
       try {
-        await recalcCosts(db, (progress) => {
-          pricingRecalcStatus = {
-            ...pricingRecalcStatus,
-            ...progress,
-            state: 'running',
-          }
+        await recalcPricing(db, {
+          currentDeviceInstanceId: options?.currentDeviceInstanceId,
+          onProgress: (progress) => {
+            pricingRecalcStatus = {
+              ...pricingRecalcStatus,
+              total: progress.total,
+              processed: progress.processed,
+              updated: progress.updatedCount,
+              skipped: progress.skippedCount,
+              state: 'running',
+            }
+          },
+          betweenBatches: () => new Promise<void>((resolve) => setImmediate(resolve)),
         })
         if (pricingNeedsRecalcSince != null && pricingRecalcGeneration === startedGeneration) {
           pricingNeedsRecalcSince = null
@@ -1213,10 +1174,9 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
         if (toolParam) filterParams.tool = toolParam
         if (deviceParam) filterParams.device = deviceParam
 
-        // Session metadata
-        const meta = db.prepare(`
+        // Session metadata: one row for the whole session, whatever tools and models it used
+        const totals = db.prepare(`
           SELECT session_id AS sessionId,
-                 tool, model,
                  MIN(ts) AS firstTs,
                  MAX(ts) AS lastTs,
                  MAX(ts) - MIN(ts) AS duration,
@@ -1229,10 +1189,24 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
                  COUNT(*) AS recordCount
           FROM records
           WHERE session_id = @sessionId ${toolClause} ${deviceClause}
-          GROUP BY session_id, tool, model
-          ORDER BY MIN(ts) ASC
-          LIMIT 1
+          GROUP BY session_id
         `).get(filterParams) as any
+
+        // Models in order of first use; `tool` and `model` stay single values (the first used)
+        const modelRows = db.prepare(`
+          SELECT tool, model
+          FROM records
+          WHERE session_id = @sessionId ${toolClause} ${deviceClause}
+          GROUP BY tool, model
+          ORDER BY MIN(ts) ASC, MIN(rowid) ASC
+        `).all(filterParams) as any[]
+        const meta = totals && {
+          sessionId: totals.sessionId,
+          tool: modelRows[0]?.tool,
+          model: modelRows[0]?.model,
+          models: [...new Set(modelRows.map(r => r.model))],
+          ...totals,
+        }
 
         // Fetch cwd from the first record that has one
         const cwdRow = db.prepare(`
@@ -1306,8 +1280,26 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
 
       // ── /api/sessions ─────────────────────────────────────────────
       if (url.pathname === '/api/sessions') {
-        const page = Math.max(1, parseInt(url.searchParams.get('page') || '1', 10))
-        const pageSize = Math.min(100, Math.max(1, parseInt(url.searchParams.get('pageSize') || '50', 10)))
+        // Absent or empty gives the default; anything but a positive integer is rejected
+        const parsePagingParam = (name: string, fallback: number): number | null => {
+          const value = url.searchParams.get(name)
+          if (value === null || value === '') return fallback
+          if (!/^\d+$/.test(value)) return null
+          const n = Number(value)
+          return Number.isSafeInteger(n) && n >= 1 ? n : null
+        }
+        const page = parsePagingParam('page', 1)
+        const requestedPageSize = parsePagingParam('pageSize', 50)
+        if (page === null || requestedPageSize === null) {
+          json(res, { error: { code: 'INVALID_PARAM', message: `Invalid ${page === null ? 'page' : 'pageSize'}` } }, 400)
+          return
+        }
+        const pageSize = Math.min(100, requestedPageSize)
+        const offset = (page - 1) * pageSize
+        if (!Number.isSafeInteger(offset)) {
+          json(res, { error: { code: 'INVALID_PARAM', message: 'Invalid page' } }, 400)
+          return
+        }
 
         const dr = getDateRangeFilter(range, from, to, 'r', weekStart)
         const device = url.searchParams.get('device')
@@ -1333,25 +1325,37 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
           WHERE 1=1 ${dr.where} ${df.localOnly ? LOCAL_ONLY_FILTER : ''} ${tf.where}
         `).get(params) as any
 
+        // Aggregate records per session first: joining tool_calls before the SUMs would count
+        // a record once per tool call. Tool calls are then counted for the page's sessions only.
+        const recordFilter = `${dr.where} ${df.localOnly ? LOCAL_ONLY_FILTER : ''} ${tf.where}`
         const sessions = db.prepare(`
-          SELECT r.session_id AS sessionId,
-                 r.tool,
-                 r.model,
-                 MIN(r.ts) AS ts,
-                 MAX(r.ts) - MIN(r.ts) AS duration,
-                 SUM(r.input_tokens) AS inputTokens,
-                 SUM(r.output_tokens) AS outputTokens,
-                 SUM(r.cache_read_tokens) AS cacheReadTokens,
-                 SUM(r.cache_write_tokens) AS cacheWriteTokens,
-                 SUM(r.cost) AS cost,
-                 COUNT(DISTINCT tc.id) AS toolCallCount
-          FROM records r
-          LEFT JOIN tool_calls tc ON tc.record_id = r.id
-          WHERE 1=1 ${dr.where} ${df.localOnly ? LOCAL_ONLY_FILTER : ''} ${tf.where}
-          GROUP BY r.session_id
-          ORDER BY MIN(r.ts) DESC
-          LIMIT @limit OFFSET @offset
-        `).all({ ...params, limit: pageSize, offset: (page - 1) * pageSize }) as any[]
+          SELECT s.sessionId, s.tool, s.model, s.ts, s.duration,
+                 s.inputTokens, s.outputTokens, s.cacheReadTokens, s.cacheWriteTokens, s.cost,
+                 (
+                   SELECT COUNT(*)
+                   FROM records r
+                   JOIN tool_calls tc ON tc.record_id = r.id
+                   WHERE r.session_id = s.sessionId ${recordFilter}
+                 ) AS toolCallCount
+          FROM (
+            SELECT r.session_id AS sessionId,
+                   r.tool,
+                   r.model,
+                   MIN(r.ts) AS ts,
+                   MAX(r.ts) - MIN(r.ts) AS duration,
+                   SUM(r.input_tokens) AS inputTokens,
+                   SUM(r.output_tokens) AS outputTokens,
+                   SUM(r.cache_read_tokens) AS cacheReadTokens,
+                   SUM(r.cache_write_tokens) AS cacheWriteTokens,
+                   SUM(r.cost) AS cost
+            FROM records r
+            WHERE 1=1 ${recordFilter}
+            GROUP BY r.session_id
+            ORDER BY MIN(r.ts) DESC, r.session_id ASC
+            LIMIT @limit OFFSET @offset
+          ) s
+          ORDER BY s.ts DESC, s.sessionId ASC
+        `).all({ ...params, limit: pageSize, offset }) as any[]
 
         json(res, {
           sessions,
@@ -1470,9 +1474,9 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
           try {
             await runDbWrite(() => {
               setUserPrice(db, data.model as string, entry)
-              const cfg = loadConfig() ?? {}
-              cfg.priceOverrides = { ...cfg.priceOverrides, [data.model as string]: entry }
-              saveConfig(cfg)
+              const cfg = updateConfig((c) => {
+                c.priceOverrides = { ...c.priceOverrides, [data.model as string]: entry }
+              })
               loadPricingRuntime(db, cfg)
             })
           } catch (error) {
@@ -1496,11 +1500,10 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
             await runDbWrite(() => {
               resetUserPriceToSynced(db, model)
               removePriceOverride(model)
-              const cfg = loadConfig() ?? {}
-              if (cfg.priceOverrides) {
-                delete cfg.priceOverrides[model]
-                saveConfig(cfg)
-              }
+              const cfg = updateConfig((c) => {
+                if (!c.priceOverrides) return false
+                delete c.priceOverrides[model]
+              })
               loadPricingRuntime(db, cfg)
             })
             json(res, { ok: true, needsRecalc: true, needsRecalcSince: markPricingNeedsRecalc() })
@@ -1647,6 +1650,8 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
       if (url.pathname === '/api/leaderboard/upload' && req.method === 'POST') {
         try {
           const result = await uploadLeaderboardData(db, options?.currentDeviceInstanceId)
+          const uploadedAt = recordLeaderboardUpload(result)
+          if (uploadedAt != null) options?.onLeaderboardUploaded?.(uploadedAt)
           json(res, {
             totalTokens: result.totalTokens,
             response: result.response,
@@ -1938,138 +1943,201 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
         if (req.method === 'PUT') {
           let body = ''
           for await (const chunk of req) body += chunk
+          let update: Record<string, unknown>
           try {
-            const update = JSON.parse(body) as Record<string, unknown>
-            const existing: Config = loadConfig() ?? {}
-
-            if ('device' in update) {
-              if (!update.device) delete existing.device
-              else existing.device = String(update.device)
-            }
-            if ('weekStart' in update) {
-              const ws = Number(update.weekStart)
-              if (ws === 0 || ws === 1) {
-                existing.weekStart = ws as 0 | 1
-                weekStart = ws as 0 | 1
-              } else {
-                delete existing.weekStart
-              }
-            }
-            if ('displayCurrency' in update) {
-              const dc = update.displayCurrency
-              if (dc === 'USD' || dc === 'CNY') {
-                existing.displayCurrency = dc
-              } else {
-                delete existing.displayCurrency
-              }
-            }
-            if ('exchangeRate' in update) {
-              const er = update.exchangeRate
-              if (er != null && typeof er === 'number' && er > 0) {
-                existing.exchangeRate = er
-              } else {
-                delete existing.exchangeRate
-              }
-            }
-
-            if ('refreshInterval' in update) {
-              if (!update.refreshInterval) {
-                delete existing.refreshInterval
-              } else {
-                existing.refreshInterval = Number(update.refreshInterval)
-              }
-              // Clean up legacy fields
-              delete existing.dashboardPollInterval
-              delete existing.parseInterval
-            }
-            if ('retentionDays' in update) {
-              if (!update.retentionDays) delete existing.retentionDays
-              else existing.retentionDays = Number(update.retentionDays)
-            }
-            if ('leaderboardAutoUpload' in update) {
-              existing.leaderboardAutoUpload = update.leaderboardAutoUpload === true
-            }
-            if ('leaderboardUploadInterval' in update) {
-              const uploadInterval = Number(update.leaderboardUploadInterval)
-              if (Number.isFinite(uploadInterval) && uploadInterval > 0) {
-                existing.leaderboardUploadInterval = uploadInterval
-              } else {
-                delete existing.leaderboardUploadInterval
-              }
-            }
-
-            if ('syncInterval' in update) {
-              const si = Number(update.syncInterval)
-              if (Number.isFinite(si) && si > 0) {
-                existing.syncInterval = si
-              } else {
-                delete existing.syncInterval
-              }
-            }
-
-            if ('sync' in update) {
-              const syncUpdate = update.sync as Record<string, unknown> | null
-              if (!syncUpdate?.backend) {
-                delete existing.sync
-              } else {
-                const backendVal = String(syncUpdate.backend)
-                if (backendVal !== 'github' && backendVal !== 's3' && backendVal !== 'cloud') {
-                  json(res, { error: { code: 'INVALID_BACKEND', message: 'sync.backend must be cloud, github, or s3' } }, 400)
-                  return
-                }
-                // Merge with existing sync config to preserve fields from other backends
-                const newSync: SyncConfig = { ...existing.sync, backend: backendVal as 'github' | 's3' | 'cloud' }
-                for (const f of ['repo', 'bucket', 'prefix', 'endpoint', 'region', 'credentialRef'] as const) {
-                  if (syncUpdate[f] != null && syncUpdate[f] !== '') (newSync as any)[f] = String(syncUpdate[f])
-                }
-                if (newSync.repo !== existing.sync?.repo) {
-                  delete newSync.githubAuth
-                  delete newSync.branch
-                  delete newSync.credentialRef
-                }
-                if (newSync.backend === 'github' && newSync.repo) validateRepo(newSync.repo)
-                if (newSync.backend === 'github' && !newSync.repo) {
-                  json(res, { error: { code: 'INVALID_SYNC_CONFIG', message: 'sync.repo is required for GitHub sync' } }, 400)
-                  return
-                }
-                if (newSync.backend === 's3' && !newSync.bucket) {
-                  json(res, { error: { code: 'INVALID_SYNC_CONFIG', message: 'sync.bucket is required for S3 sync' } }, 400)
-                  return
-                }
-                existing.sync = newSync
-              }
-            }
-
-            if (update.credentials && typeof update.credentials === 'object') {
-              const creds = update.credentials as Record<string, unknown>
-              const c: Record<string, string> = existing.credentials ?? {}
-              for (const [key, val] of Object.entries(creds)) {
-                if (val !== '' && val !== null && val !== undefined) {
-                  c[key] = String(val)
-                }
-              }
-              if (Object.keys(c).length) existing.credentials = c
-              else delete existing.credentials
-            }
-
-            if (update.syncCredentials && typeof update.syncCredentials === 'object') {
-              setSyncCredentials(existing, update.syncCredentials as Record<string, unknown>)
-            }
-
-            saveConfig(existing)
-            const consentConfig = buildConsentConfig(existing)
-            const syncTarget = getSyncTarget(existing.sync)
-            if (consentConfig && syncTarget) {
-              setSyncConsent(AIUSAGE_DIR, syncTarget, {
-                syncConsentAt: Date.now(),
-                syncConsentTarget: generateConsentFingerprint(consentConfig),
-              })
-            }
-            options?.onConfigUpdated?.()
-            json(res, { ok: true })
+            update = JSON.parse(body) as Record<string, unknown>
           } catch {
             json(res, { error: { code: 'INVALID_JSON', message: 'Invalid JSON body' } }, 400)
+            return
           }
+          // Set once config.json is written: a failure after that point (the
+          // consent in state.json) must not be reported as nothing saved.
+          let configSaved = false
+          const syncCredentials = update.syncCredentials && typeof update.syncCredentials === 'object'
+            ? update.syncCredentials as Record<string, unknown> : undefined
+          // A new GitHub token goes to the OS keychain first, outside the
+          // settings lock: the keychain can wait on the user (an access
+          // prompt), and other processes must not wait on that to save
+          // state.json or config.json. It is removed again unless the saved
+          // config refers to it.
+          let storedTokenId: string | undefined
+          let storedTokenKept = false
+          try {
+            const githubToken = syncCredentials?.githubToken
+            if (typeof githubToken === 'string' && githubToken) {
+              storedTokenId = saveGitHubCredentials({ method: 'pat', accessToken: githubToken })
+            }
+            // Read, change and save under the settings lock, so that a change
+            // another process saves meanwhile (`aiusage init`, a login, a
+            // sync) is not written over with the copy read here.
+            const saved = withSettingsLock(AIUSAGE_DIR, (): boolean => {
+              const existing: Config = loadConfig() ?? {}
+
+              if ('device' in update) {
+                if (!update.device) delete existing.device
+                else existing.device = String(update.device)
+              }
+              if ('weekStart' in update) {
+                const ws = Number(update.weekStart)
+                if (ws === 0 || ws === 1) {
+                  existing.weekStart = ws as 0 | 1
+                  weekStart = ws as 0 | 1
+                } else {
+                  delete existing.weekStart
+                }
+              }
+              if ('displayCurrency' in update) {
+                const dc = update.displayCurrency
+                if (dc === 'USD' || dc === 'CNY') {
+                  existing.displayCurrency = dc
+                } else {
+                  delete existing.displayCurrency
+                }
+              }
+              if ('exchangeRate' in update) {
+                const er = update.exchangeRate
+                if (er != null && typeof er === 'number' && er > 0) {
+                  existing.exchangeRate = er
+                } else {
+                  delete existing.exchangeRate
+                }
+              }
+
+              // Milliseconds. A delay above 2^31 - 1 overflows a Node timer, which then
+              // fires every 1 ms, and a value typed in seconds runs back to back.
+              // A blank or zero value still clears the setting.
+              const intervalBounds: Array<[string, number, number]> = [
+                ['refreshInterval', 1000, 2147483647],
+                ['leaderboardUploadInterval', 3600000, 31536000000],
+                ['syncInterval', 60000, 2147483647],
+              ]
+              const intervals: Record<string, number | undefined> = {}
+              for (const [field, min, max] of intervalBounds) {
+                const raw = update[field]
+                if (raw == null || raw === false || raw === '' || raw === 0 || raw === '0') continue
+                const value = typeof raw === 'number' || typeof raw === 'string' ? Number(raw) : NaN
+                if (!Number.isFinite(value) || value < min || value > max) {
+                  // Nothing is saved, so undo the week start this request may have applied above.
+                  weekStart = (loadConfig()?.weekStart ?? 1) as 0 | 1
+                  json(res, { error: { code: 'INVALID_INTERVAL', message: `${field} must be a number of milliseconds between ${min} and ${max}` } }, 400)
+                  return false
+                }
+                intervals[field] = value
+              }
+
+              if ('refreshInterval' in update) {
+                if (intervals.refreshInterval == null) {
+                  delete existing.refreshInterval
+                } else {
+                  existing.refreshInterval = intervals.refreshInterval
+                }
+                // Clean up legacy fields
+                delete existing.dashboardPollInterval
+                delete existing.parseInterval
+              }
+              if ('retentionDays' in update) {
+                if (!update.retentionDays) delete existing.retentionDays
+                else existing.retentionDays = Number(update.retentionDays)
+              }
+              if ('leaderboardAutoUpload' in update) {
+                existing.leaderboardAutoUpload = update.leaderboardAutoUpload === true
+              }
+              if ('leaderboardUploadInterval' in update) {
+                const uploadInterval = intervals.leaderboardUploadInterval
+                if (uploadInterval != null) {
+                  existing.leaderboardUploadInterval = uploadInterval
+                } else {
+                  delete existing.leaderboardUploadInterval
+                }
+              }
+
+              if ('syncInterval' in update) {
+                const si = intervals.syncInterval
+                if (si != null) {
+                  existing.syncInterval = si
+                } else {
+                  delete existing.syncInterval
+                }
+              }
+
+              if ('sync' in update) {
+                const syncUpdate = update.sync as Record<string, unknown> | null
+                if (!syncUpdate?.backend) {
+                  delete existing.sync
+                } else {
+                  const backendVal = String(syncUpdate.backend)
+                  if (backendVal !== 'github' && backendVal !== 's3' && backendVal !== 'cloud') {
+                    json(res, { error: { code: 'INVALID_BACKEND', message: 'sync.backend must be cloud, github, or s3' } }, 400)
+                    return false
+                  }
+                  // Merge with existing sync config to preserve fields from other backends
+                  const newSync: SyncConfig = { ...existing.sync, backend: backendVal as 'github' | 's3' | 'cloud' }
+                  for (const f of ['repo', 'bucket', 'prefix', 'endpoint', 'region', 'credentialRef'] as const) {
+                    if (syncUpdate[f] != null && syncUpdate[f] !== '') (newSync as any)[f] = String(syncUpdate[f])
+                  }
+                  if (newSync.repo !== existing.sync?.repo) {
+                    delete newSync.githubAuth
+                    delete newSync.branch
+                    delete newSync.credentialRef
+                  }
+                  if (newSync.backend === 'github' && newSync.repo) validateRepo(newSync.repo)
+                  if (newSync.backend === 'github' && !newSync.repo) {
+                    json(res, { error: { code: 'INVALID_SYNC_CONFIG', message: 'sync.repo is required for GitHub sync' } }, 400)
+                    return false
+                  }
+                  if (newSync.backend === 's3' && !newSync.bucket) {
+                    json(res, { error: { code: 'INVALID_SYNC_CONFIG', message: 'sync.bucket is required for S3 sync' } }, 400)
+                    return false
+                  }
+                  existing.sync = newSync
+                }
+              }
+
+              if (update.credentials && typeof update.credentials === 'object') {
+                const creds = update.credentials as Record<string, unknown>
+                const c: Record<string, string> = existing.credentials ?? {}
+                for (const [key, val] of Object.entries(creds)) {
+                  if (val !== '' && val !== null && val !== undefined) {
+                    c[key] = String(val)
+                  }
+                }
+                if (Object.keys(c).length) existing.credentials = c
+                else delete existing.credentials
+              }
+
+              if (syncCredentials) setSyncCredentials(existing, syncCredentials, storedTokenId)
+
+              saveConfig(existing)
+              configSaved = true
+              storedTokenKept = storedTokenId !== undefined && existing.sync?.githubAuth?.credentialId === storedTokenId
+              const consentConfig = buildConsentConfig(existing)
+              const syncTarget = getSyncTarget(existing.sync)
+              if (consentConfig && syncTarget) {
+                setSyncConsent(AIUSAGE_DIR, syncTarget, {
+                  syncConsentAt: Date.now(),
+                  syncConsentTarget: generateConsentFingerprint(consentConfig),
+                })
+              }
+              return true
+            })
+            if (!saved) return
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            if (configSaved) {
+              // The settings are in config.json: run with them, and say what failed.
+              options?.onConfigUpdated?.()
+              json(res, { error: { code: 'CONSENT_NOT_SAVED', message: `The settings were saved, but the sync consent was not: ${message}` } }, 500)
+            } else if (error instanceof GitHubAuthError) {
+              json(res, { error: { code: 'INVALID_SYNC_CONFIG', message } }, 400)
+            } else {
+              json(res, { error: { code: error instanceof JsonFileError ? 'SETTINGS_FILE_UNUSABLE' : 'CONFIG_NOT_SAVED', message } }, 500)
+            }
+            return
+          } finally {
+            if (storedTokenId && !storedTokenKept) deleteGitHubCredentials(storedTokenId)
+          }
+          options?.onConfigUpdated?.()
+          json(res, { ok: true })
           return
         }
       }
@@ -2091,7 +2159,7 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
             return
           }
           if (!isKelivoBackupFilename(upload.filename)) {
-            json(res, { error: { code: 'INVALID_FILE', message: 'Upload a Kelivo .zip backup or chats.json' } }, 400)
+            json(res, { error: { code: 'INVALID_FILE', message: 'Upload a Kelivo .zip backup, chats.json, or Kelivo database (.db/.sqlite)' } }, 400)
             return
           }
 
@@ -2101,22 +2169,37 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
 
           const cfg = loadConfig()
           const now = Date.now()
-          const result = await runParseKelivo({
+          const deviceInstanceId = options?.currentDeviceInstanceId ?? 'unknown'
+          // A message imported before this installation had a device id keeps
+          // the record it was stored under (see recordIdsForReread), which can
+          // fold a copy into it, so the backup is read in the write queue.
+          const result = await runDbWrite(() => runParseKelivo({
             filePath: tempPath,
             device: getDeviceName(),
-            deviceInstanceId: options?.currentDeviceInstanceId ?? 'unknown',
+            deviceInstanceId,
+            recordId: recordIdsForReread(db, deviceInstanceId).recordId,
             platform: cfg?.platform ?? platform(),
             now,
             exchangeRate: resolveExchangeRate(cfg ?? {}),
-          })
+          }))
           if (result.errors.length > 0 && result.records.length === 0) {
             json(res, { error: { code: 'IMPORT_FAILED', message: result.errors[0] }, errors: result.errors }, 400)
             return
           }
 
+          // The upload lives in a temp directory here; report the name the user
+          // picked instead of this machine's temp path.
+          const forUser = (message: string) => message.split(tempPath).join(upload.filename)
+
           const existingCount = await runDbWrite(() => {
             const existingCount = countExistingRecordIds(db, result.records.map((record) => record.id))
-            for (const record of result.records) insertRecord(db, record)
+            // Ignore temp-path-only differences so an unchanged upload is not
+            // queued for sync again, while still recording the manual import.
+            insertChangedRecords(db, result.records)
+            const stampImport = db.prepare('UPDATE records SET ingested_at = ? WHERE id = ?')
+            for (const record of result.records) {
+              stampImport.run(now, record.id)
+            }
             return existingCount
           })
           const imported = result.records.length
@@ -2125,7 +2208,8 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
             imported,
             added,
             lastImportedAt: imported > 0 ? now : undefined,
-            errors: result.errors,
+            errors: result.errors.map(forUser),
+            warnings: result.warnings.map(forUser),
           })
         } finally {
           if (tempDir) rmSync(tempDir, { recursive: true, force: true })
@@ -2140,10 +2224,9 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
           json(res, { error: { code: 'FETCH_FAILED', message: 'Failed to fetch exchange rate' } }, 502)
           return
         }
-        const cfg = loadConfig() ?? {}
-        cfg.exchangeRateCache = { CNY_USD: rate, fetchedAt: Date.now() }
-        saveConfig(cfg)
-        json(res, { rate, fetchedAt: cfg.exchangeRateCache.fetchedAt })
+        const exchangeRateCache = { CNY_USD: rate, fetchedAt: Date.now() }
+        updateConfig((cfg) => { cfg.exchangeRateCache = exchangeRateCache })
+        json(res, { rate, fetchedAt: exchangeRateCache.fetchedAt })
         return
       }
 
